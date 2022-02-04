@@ -101,49 +101,21 @@ class MotionOptimizer:
         self.motion_prior = motion_prior
         self.init_motion_prior = init_motion_prior
         self.latent_motion = None
-        if self.motion_prior is not None:
-            # need latent dynamics sequence as well
-            self.latent_motion_dim = self.motion_prior.latent_size
-            self.cond_prior = self.motion_prior.use_conditional_prior
-            # additional optimization params to set later
-            self.trans_vel = None
-            self.root_orient_vel = None
-            self.joints_vel = None
-        else:
-            Logger.log("Need the motion prior to use all-implicit parameterization!")
-            exit()
+        assert self.motion_prior is not None
+        # need latent dynamics sequence as well
+        self.latent_motion_dim = self.motion_prior.latent_size
+        self.cond_prior = self.motion_prior.use_conditional_prior
+        # additional optimization params to set later
+        self.trans_vel = None
+        self.root_orient_vel = None
+        self.joints_vel = None
 
         self.init_fidx = np.zeros(
             (B)
         )  # the frame chosen to use for the initial state (first frame by default)
 
         self.cam_f = self.cam_center = None
-        if self.optim_floor:
-            if camera_matrix is None:
-                Logger.log(
-                    "Must have camera intrinsics (camera_matrix) to optimize the floor plane!"
-                )
-                exit()
-            # NOTE: we assume a static camera, so we optimize the params of the floor plane instead of camera extrinsics
-            self.floor_plane = torch.zeros((B, 3)).to(
-                device
-            )  # normal vector (a, b, c) scaled by offset (d)
-            self.floor_plane[:, 2] = 1.0  # up axis initially
-            # will not be optimized, extra auxiliary variables which are determined from the floor plane and root orient pose
-            #       we only have one transformation for the chosen "key" frame in the sequence
-            self.cam2prior_R = (
-                torch.eye(3).reshape((1, 3, 3)).expand((B, 3, 3)).to(device)
-            )
-            self.cam2prior_t = torch.zeros((B, 3)).to(device)
-            self.cam2prior_root_height = torch.zeros((B, 1)).to(device)
-
-            cam_fx = camera_matrix[:, 0, 0]
-            cam_fy = camera_matrix[:, 1, 1]
-            cam_cx = camera_matrix[:, 0, 2]
-            cam_cy = camera_matrix[:, 1, 2]
-            # focal length and center are same for all timesteps
-            self.cam_f = torch.stack([cam_fx, cam_fy], dim=1)
-            self.cam_center = torch.stack([cam_cx, cam_cy], dim=1)
+        assert not self.optim_floor
         self.use_camera = self.cam_f is not None and self.cam_center is not None
 
         #
@@ -170,78 +142,7 @@ class MotionOptimizer:
         ).to(device)
 
     def initialize(self, observed_data):
-
-        if self.optim_floor:
-            # initialize the floor
-            # assumes observed floor is (a, b, c, d) where (a, b, c) is the normal and (d) the offset
-            floor_normals = observed_data["floor_plane"][:, :3]
-            floor_offsets = observed_data["floor_plane"][:, 3:]
-            self.floor_plane = floor_normals * floor_offsets
-            self.floor_plane = self.floor_plane.to(torch.float).clone().detach()
-            self.floor_plane.requires_grad = True
-
-            # optimizing from 2D data, must initialize cam/body trans
-            if "points3d" in observed_data:
-                # initialize with mean of point cloud
-                point_seq = observed_data["points3d"]  # B x T x N x 3
-                self.trans = torch.mean(point_seq, dim=2).clone().detach()
-            elif "joints2d" in observed_data:
-                # only have RGB data to use
-                # use focal length and bone lengths to approximate
-                # (based on PROX https://github.com/mohamedhassanmus/prox/blob/master/prox/fitting.py)
-
-                # get 3D joints mapped to OpenPose
-                body_pose = self.latent2pose(self.latent_pose)
-                pred_data, _ = self.smpl_results(
-                    self.trans, self.root_orient, body_pose, self.betas
-                )
-                joints3d_full = torch.cat(
-                    [pred_data["joints3d"], pred_data["joints3d_extra"]], dim=2
-                )
-                joints3d_op = joints3d_full[:, :, self.smpl2op_map, :]
-                # openpose observations
-                joints2d_obs = observed_data["joints2d"][:, :, :, :2]
-                joints2d_conf = observed_data["joints2d"][:, :, :, 2]
-
-                # find least-occluded 2d frame
-                num_2d_vis = torch.sum(joints2d_conf > 0.0, dim=2)
-                best_2d_idx = torch.max(num_2d_vis, dim=1)[1]
-
-                # calculate bone lengths and confidence in each bone length
-                bone3d = []
-                bone2d = []
-                conf2d = []
-                for pair in OP_EDGE_LIST:
-                    diff3d = torch.norm(
-                        joints3d_op[:, 0, pair[0], :] - joints3d_op[:, 0, pair[1], :],
-                        dim=1,
-                    )  # does not change over time
-                    diff2d = torch.norm(
-                        joints2d_obs[:, :, pair[0], :] - joints2d_obs[:, :, pair[1], :],
-                        dim=2,
-                    )
-                    minconf2d = torch.min(
-                        joints2d_conf[:, :, pair[0]], joints2d_conf[:, :, pair[1]]
-                    )
-                    bone3d.append(diff3d)
-                    bone2d.append(diff2d)
-                    conf2d.append(minconf2d)
-
-                bone3d = torch.stack(bone3d, dim=1)
-                bone2d = torch.stack(bone2d, dim=2)
-                bone2d = bone2d[np.arange(self.batch_size), best_2d_idx, :]
-                conf2d = torch.stack(conf2d, dim=2)
-                conf2d = conf2d[np.arange(self.batch_size), best_2d_idx, :]
-
-                # mean over all
-                mean_bone3d = torch.mean(bone3d, dim=1)
-                mean_bone2d = torch.mean(bone2d * (conf2d > 0.0), dim=1)
-
-                # approx z based on ratio
-                init_z = self.cam_f[:, 0] * (mean_bone3d / mean_bone2d)
-                self.trans[:, :, 2] = (
-                    init_z.unsqueeze(1).expand((self.batch_size, self.seq_len)).detach()
-                )
+        assert not self.optim_floor
 
     def run(
         self,
@@ -254,19 +155,11 @@ class MotionOptimizer:
         fit_gender="neutral",
     ):
 
-        if len(num_iter) != 3:
-            print(
-                "Must have num iters for 3 stages! But %d stages were given!"
-                % (len(num_iter))
-            )
-            exit()
+        assert len(num_iter) == 3
 
         per_stage_outputs = {}  # SMPL results after each stage
 
-        #
-        # Initialization
-        #
-        self.initialize(observed_data)
+        self.initialize(observed_data) # does nothing if not using floor
 
         #
         # Stage I: Only global root and orientation
@@ -314,20 +207,20 @@ class MotionOptimizer:
         )
         per_stage_outputs["stage1"] = stage1_pred_data
 
-        if stages_res_out is not None:
-            res_betas = self.betas.clone().detach().cpu().numpy()
-            res_trans = self.trans.clone().detach().cpu().numpy()
-            res_root_orient = self.root_orient.clone().detach().cpu().numpy()
-            res_body_pose = body_pose.clone().detach().cpu().numpy()
-            for bidx, res_out_path in enumerate(stages_res_out):
-                cur_res_out_path = os.path.join(res_out_path, "stage1_results.npz")
-                np.savez(
-                    cur_res_out_path,
-                    betas=res_betas[bidx],
-                    trans=res_trans[bidx],
-                    root_orient=res_root_orient[bidx],
-                    pose_body=res_body_pose[bidx],
-                )
+        assert stages_res_out is not None
+        res_betas = self.betas.clone().detach().cpu().numpy()
+        res_trans = self.trans.clone().detach().cpu().numpy()
+        res_root_orient = self.root_orient.clone().detach().cpu().numpy()
+        res_body_pose = body_pose.clone().detach().cpu().numpy()
+        for bidx, res_out_path in enumerate(stages_res_out):
+            cur_res_out_path = os.path.join(res_out_path, "stage1_results.npz")
+            np.savez(
+                cur_res_out_path,
+                betas=res_betas[bidx],
+                trans=res_trans[bidx],
+                root_orient=res_root_orient[bidx],
+                pose_body=res_body_pose[bidx],
+            )
 
         #
         # Stage II full pose and shape
@@ -378,25 +271,22 @@ class MotionOptimizer:
         )
         per_stage_outputs["stage2"] = stage2_pred_data
 
-        if stages_res_out is not None:
-            res_betas = self.betas.clone().detach().cpu().numpy()
-            res_trans = self.trans.clone().detach().cpu().numpy()
-            res_root_orient = self.root_orient.clone().detach().cpu().numpy()
-            res_body_pose = body_pose.clone().detach().cpu().numpy()
-            for bidx, res_out_path in enumerate(stages_res_out):
-                cur_res_out_path = os.path.join(res_out_path, "stage2_results.npz")
-                np.savez(
-                    cur_res_out_path,
-                    betas=res_betas[bidx],
-                    trans=res_trans[bidx],
-                    root_orient=res_root_orient[bidx],
-                    pose_body=res_body_pose[bidx],
-                )
+        assert stages_res_out is not None
+        res_betas = self.betas.clone().detach().cpu().numpy()
+        res_trans = self.trans.clone().detach().cpu().numpy()
+        res_root_orient = self.root_orient.clone().detach().cpu().numpy()
+        res_body_pose = body_pose.clone().detach().cpu().numpy()
+        for bidx, res_out_path in enumerate(stages_res_out):
+            cur_res_out_path = os.path.join(res_out_path, "stage2_results.npz")
+            np.savez(
+                cur_res_out_path,
+                betas=res_betas[bidx],
+                trans=res_trans[bidx],
+                root_orient=res_root_orient[bidx],
+                pose_body=res_body_pose[bidx],
+            )
 
-        if self.motion_prior is None:
-            # No need to continue optimizing
-            return self.get_optim_result(body_pose), per_stage_outputs
-
+        assert not self.motion_prior is None
         #
         # Stage III full pose and shape with motion prior
         #
@@ -413,29 +303,7 @@ class MotionOptimizer:
         # initialize latent motion with inference from the current SMPL sequence
         cur_body_pose = self.latent2pose(self.latent_pose)
 
-        if self.optim_floor:
-            # initialize camera2prior transformation
-            init_smpl_data, _ = self.smpl_results(
-                self.trans, self.root_orient, cur_body_pose, self.betas
-            )
-            (
-                self.cam2prior_R,
-                self.cam2prior_t,
-                self.cam2prior_root_height,
-            ) = compute_cam2prior(
-                self.floor_plane,
-                self.trans[np.arange(self.batch_size), self.init_fidx],
-                self.root_orient[np.arange(self.batch_size), self.init_fidx],
-                init_smpl_data["joints3d"][np.arange(self.batch_size), self.init_fidx],
-            )
-
-            # save stage 2 output in prior frame later (after we get final floor estimate) to compare to
-            stage2_result_data_dict = {
-                "trans": self.trans.clone().detach(),
-                "root_orient": self.root_orient.clone().detach(),
-                "pose_body": cur_body_pose.clone().detach(),
-                "betas": self.betas.clone().detach(),
-            }
+        assert not self.optim_floor
 
         self.latent_motion = self.infer_latent_motion(
             self.trans, self.root_orient, cur_body_pose, self.betas, data_fps
@@ -443,45 +311,29 @@ class MotionOptimizer:
         self.latent_motion.requires_grad = True
 
         # also need additional optim params for additional prior inputs at first frame (to enable rollout)
-        if self.motion_prior.model_data_config in [
+        assert self.motion_prior.model_data_config in [
             "smpl+joints",
             "smpl+joints+contacts",
-        ]:
-            # initialize from current SMPL sequence
-            vel_trans = self.trans
-            vel_root_orient = self.root_orient
-            if self.optim_floor:
-                # velocities are always kept in the canonical space since they are only used here for rollout
-                data_dict = {"trans": self.trans, "root_orient": self.root_orient}
-                prior_data_dict = self.apply_cam2prior(
-                    data_dict,
-                    self.cam2prior_R,
-                    self.cam2prior_t,
-                    self.cam2prior_root_height,
-                    cur_body_pose,
-                    self.betas,
-                    self.init_fidx,
-                )
-                vel_trans = prior_data_dict["trans"]
-                vel_root_orient = prior_data_dict["root_orient"]
+        ]
+        # initialize from current SMPL sequence
+        vel_trans = self.trans
+        vel_root_orient = self.root_orient
+        assert not self.optim_floor
+        (
+            self.trans_vel,
+            self.joints_vel,
+            self.root_orient_vel,
+        ) = self.estimate_velocities(
+            self.trans, self.root_orient, cur_body_pose, self.betas, data_fps
+        )
 
-            (
-                self.trans_vel,
-                self.joints_vel,
-                self.root_orient_vel,
-            ) = self.estimate_velocities(
-                self.trans, self.root_orient, cur_body_pose, self.betas, data_fps
-            )
-
-            self.trans_vel = self.trans_vel[:, :1].detach()
-            self.joints_vel = self.joints_vel[:, :1].detach()
-            self.root_orient_vel = self.root_orient_vel[:, :1].detach()
-            self.trans_vel.requires_grad = True
-            self.joints_vel.requires_grad = True
-            self.root_orient_vel.requires_grad = True
-            prior_opt_params = [self.trans_vel, self.joints_vel, self.root_orient_vel]
-        else:
-            raise NotImplementedError("data return config not supported")
+        self.trans_vel = self.trans_vel[:, :1].detach()
+        self.joints_vel = self.joints_vel[:, :1].detach()
+        self.root_orient_vel = self.root_orient_vel[:, :1].detach()
+        self.trans_vel.requires_grad = True
+        self.joints_vel.requires_grad = True
+        self.root_orient_vel.requires_grad = True
+        prior_opt_params = [self.trans_vel, self.joints_vel, self.root_orient_vel]
 
         # update SMPL optim variables to be only initial state (initialized to current value)
         self.trans = self.trans[:, :1].detach()
@@ -491,15 +343,12 @@ class MotionOptimizer:
         self.trans.requires_grad = True
         self.root_orient.requires_grad = True
         self.latent_pose.requires_grad = True
-        if self.optim_floor:
-            self.floor_plane.requires_grad = True
+        assert not self.optim_floor
         self.betas.requires_grad = True
 
         motion_opt_params = [self.trans, self.root_orient, self.latent_pose, self.betas]
         motion_opt_params += [self.latent_motion]
         motion_opt_params += prior_opt_params
-        if self.optim_floor:
-            motion_opt_params += [self.floor_plane]
 
         # record intiialization stats
         body_pose = self.latent2pose(self.latent_pose)
@@ -524,64 +373,34 @@ class MotionOptimizer:
             )
         per_stage_outputs["stage3_init"] = stage3_init_pred_data
 
-        if stages_res_out is not None:
-            res_body_pose = (
-                cam_rollout_results["pose_body"].clone().detach().cpu().numpy()
-            )
-            res_trans = (
-                cam_rollout_results["trans"].clone().detach().cpu().cpu().numpy()
-            )
-            res_root_orient = (
-                cam_rollout_results["root_orient"].clone().detach().cpu().numpy()
-            )
-            res_betas = self.betas.clone().detach().cpu().numpy()
+        assert stages_res_out is not None
+        res_body_pose = (
+            cam_rollout_results["pose_body"].clone().detach().cpu().numpy()
+        )
+        res_trans = (
+            cam_rollout_results["trans"].clone().detach().cpu().cpu().numpy()
+        )
+        res_root_orient = (
+            cam_rollout_results["root_orient"].clone().detach().cpu().numpy()
+        )
+        res_betas = self.betas.clone().detach().cpu().numpy()
 
-            # camera frame
-            for bidx, res_out_path in enumerate(stages_res_out):
-                cur_res_out_path = os.path.join(res_out_path, "stage3_init_results.npz")
-                save_dict = {
-                    "betas": res_betas[bidx],
-                    "trans": res_trans[bidx],
-                    "root_orient": res_root_orient[bidx],
-                    "pose_body": res_body_pose[bidx],
-                }
-                if "contacts" in rollout_results:
-                    save_dict["contacts"] = (
-                        rollout_results["contacts"][bidx].clone().detach().cpu().numpy()
-                    )
-                if self.optim_floor:
-                    save_dict["floor_plane"] = (
-                        self.floor_plane[bidx].clone().detach().cpu().numpy()
-                    )
-                np.savez(cur_res_out_path, **save_dict)
+        # camera frame
+        for bidx, res_out_path in enumerate(stages_res_out):
+            cur_res_out_path = os.path.join(res_out_path, "stage3_init_results.npz")
+            save_dict = {
+                "betas": res_betas[bidx],
+                "trans": res_trans[bidx],
+                "root_orient": res_root_orient[bidx],
+                "pose_body": res_body_pose[bidx],
+            }
+            if "contacts" in rollout_results:
+                save_dict["contacts"] = (
+                    rollout_results["contacts"][bidx].clone().detach().cpu().numpy()
+                )
+            np.savez(cur_res_out_path, **save_dict)
 
-            # prior frame
-            if self.optim_floor:
-                res_trans = (
-                    rollout_results["trans"].clone().detach().cpu().cpu().numpy()
-                )
-                res_root_orient = (
-                    rollout_results["root_orient"].clone().detach().cpu().numpy()
-                )
-                for bidx, res_out_path in enumerate(stages_res_out):
-                    cur_res_out_path = os.path.join(
-                        res_out_path, "stage3_init_results_prior.npz"
-                    )
-                    save_dict = {
-                        "betas": res_betas[bidx],
-                        "trans": res_trans[bidx],
-                        "root_orient": res_root_orient[bidx],
-                        "pose_body": res_body_pose[bidx],
-                    }
-                    if "contacts" in rollout_results:
-                        save_dict["contacts"] = (
-                            rollout_results["contacts"][bidx]
-                            .clone()
-                            .detach()
-                            .cpu()
-                            .numpy()
-                        )
-                    np.savez(cur_res_out_path, **save_dict)
+        assert not self.optim_floor
 
         init_motion_scale = 1.0  # single-step losses must be scaled commensurately with losses summed over whole sequence
         motion_optim = torch.optim.LBFGS(
@@ -592,22 +411,20 @@ class MotionOptimizer:
         )
 
         motion_optim_curr = motion_optim_refine = None
-        if self.stage3_tune_init_state:
-            freeze_optim_params = [self.latent_motion, self.betas]
-            if self.optim_floor:
-                freeze_optim_params += [self.floor_plane]
-            motion_optim_curr = torch.optim.LBFGS(
-                freeze_optim_params,
-                max_iter=lbfgs_max_iter,
-                lr=lr,
-                line_search_fn=LINE_SEARCH,
-            )
-            motion_optim_refine = torch.optim.LBFGS(
-                motion_opt_params,
-                max_iter=lbfgs_max_iter,
-                lr=lr,
-                line_search_fn=LINE_SEARCH,
-            )
+        assert self.stage3_tune_init_state
+        freeze_optim_params = [self.latent_motion, self.betas]
+        motion_optim_curr = torch.optim.LBFGS(
+            freeze_optim_params,
+            max_iter=lbfgs_max_iter,
+            lr=lr,
+            line_search_fn=LINE_SEARCH,
+        )
+        motion_optim_refine = torch.optim.LBFGS(
+            motion_opt_params,
+            max_iter=lbfgs_max_iter,
+            lr=lr,
+            line_search_fn=LINE_SEARCH,
+        )
         cur_stage3_nsteps = self.stage3_tune_init_num_frames
         saved_contact_height_weight = self.fitting_loss.loss_weights["contact_height"]
         saved_contact_vel_weight = self.fitting_loss.loss_weights["contact_vel"]
@@ -660,21 +477,7 @@ class MotionOptimizer:
                 motion_optim.zero_grad()
 
                 cur_body_pose = self.latent2pose(self.latent_pose)
-                if self.optim_floor:
-                    # update the cam2prior transformation based on current initial state variable and floor values
-                    cam_smpl_data, _ = self.smpl_results(
-                        self.trans, self.root_orient, cur_body_pose, self.betas
-                    )
-                    (
-                        self.cam2prior_R,
-                        self.cam2prior_t,
-                        self.cam2prior_root_height,
-                    ) = compute_cam2prior(
-                        self.floor_plane,
-                        self.trans[:, 0],
-                        self.root_orient[:, 0],
-                        cam_smpl_data["joints3d"][:, 0],
-                    )
+                assert not self.optim_floor
 
                 pred_data = dict()
                 # Use current params to go through SMPL and get joints3d, verts3d, points3d
@@ -738,13 +541,7 @@ class MotionOptimizer:
                     pred_data["contacts_conf"] = cur_contacts_conf
 
                 cam_pred_data = pred_data
-                if self.optim_floor:
-                    cam_pred_data, _ = self.smpl_results(
-                        cur_cam_trans, cur_cam_root_orient, cur_body_pose, cur_betas
-                    )
-                    cam_pred_data["latent_pose"] = cur_latent_pose
-                    cam_pred_data["betas"] = cur_betas
-                    cam_pred_data["floor_plane"] = self.floor_plane
+                assert not self.optim_floor
 
                 loss_nsteps = self.seq_len
                 loss_obs_data = observed_data
@@ -819,72 +616,13 @@ class MotionOptimizer:
                 stage3_pred_data["joints3d_rollout"] = rollout_joints
         if rollout_results is not None and "contacts" in rollout_results:
             stage3_pred_data["contacts"] = rollout_results["contacts"]
-        if self.optim_floor:
-            stage3_pred_data["prior_trans"] = rollout_results["trans"]
-            stage3_pred_data["prior_root_orient"] = rollout_results["root_orient"]
         per_stage_outputs["stage3"] = stage3_pred_data
 
         final_optim_res = self.get_optim_result(body_pose)
         if rollout_results is not None and "contacts" in rollout_results:
             final_optim_res["contacts"] = rollout_results["contacts"]
 
-        if self.optim_floor:
-            # go back and also save results from stage 2 using the final optimized floor to transform to prior frame
-            if stages_res_out is not None:
-                # need to recompute the tranformation for stage 2 results with the final floor
-                stg2_cam_smpl_data, _ = self.smpl_results(
-                    stage2_result_data_dict["trans"],
-                    stage2_result_data_dict["root_orient"],
-                    stage2_result_data_dict["pose_body"],
-                    stage2_result_data_dict["betas"],
-                )
-                (
-                    stg2_cam2prior_R,
-                    stg2_cam2prior_t,
-                    stg2_cam2prior_root_height,
-                ) = compute_cam2prior(
-                    self.floor_plane,
-                    stage2_result_data_dict["trans"][
-                        np.arange(self.batch_size), self.init_fidx
-                    ],
-                    stage2_result_data_dict["root_orient"][
-                        np.arange(self.batch_size), self.init_fidx
-                    ],
-                    stg2_cam_smpl_data["joints3d"][
-                        np.arange(self.batch_size), self.init_fidx
-                    ],
-                )
-                stage2_prior_data_dict = self.apply_cam2prior(
-                    stage2_result_data_dict,
-                    stg2_cam2prior_R,
-                    stg2_cam2prior_t,
-                    stg2_cam2prior_root_height,
-                    stage2_result_data_dict["pose_body"],
-                    stage2_result_data_dict["betas"],
-                    self.init_fidx,
-                )
-
-            if stages_res_out is not None:
-                # save stage 2 output in prior frame to compare to
-                res_betas = self.betas.clone().detach().cpu().numpy()
-                res_trans = (
-                    stage2_prior_data_dict["trans"].clone().detach().cpu().numpy()
-                )
-                res_root_orient = (
-                    stage2_prior_data_dict["root_orient"].clone().detach().cpu().numpy()
-                )
-                res_body_pose = cur_body_pose.clone().detach().cpu().numpy()
-                for bidx, res_out_path in enumerate(stages_res_out):
-                    cur_res_out_path = os.path.join(
-                        res_out_path, "stage2_results_prior.npz"
-                    )
-                    np.savez(
-                        cur_res_out_path,
-                        betas=res_betas[bidx],
-                        trans=res_trans[bidx],
-                        root_orient=res_root_orient[bidx],
-                        pose_body=res_body_pose[bidx],
-                    )
+        assert not self.optim_floor
 
         return final_optim_res, per_stage_outputs
 
