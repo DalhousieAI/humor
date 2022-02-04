@@ -112,7 +112,7 @@ def prepare_data(data, use_overlap_loss, res_out_path):
     cam_mat = None
 
     class Data(nn.Module):
-        "data class to make it easy to cast Tensors to cuda"
+        "data class-like to make it easy to cast Tensors"
         def __init__(self, **data_dict):
             super(Data, self).__init__()
             # make every key in the data dict a parameter
@@ -136,6 +136,10 @@ def prepare_data(data, use_overlap_loss, res_out_path):
             return {k : getattr(self, k) for k in self._keys}
         def __contains__(self, item):
             return item in self._keys
+        def detach(self):
+            for p in self.parameters():
+                p.requires_grad = False
+
     return Data(
         observed_data=Data(**observed_data),
         gt_data=Data(**gt_data),
@@ -147,7 +151,8 @@ def prepare_data(data, use_overlap_loss, res_out_path):
         cur_z_init_paths=cur_z_init_paths,
         cur_z_final_paths=cur_z_final_paths,
         cur_res_out_paths=cur_res_out_paths,
-        cam_mat=cam_mat
+        cam_mat=cam_mat,
+        res_out_path=res_out_path
         )
 
 def save_info(args, gt_data, cur_res_out_paths):
@@ -173,6 +178,82 @@ def save_info(args, gt_data, cur_res_out_paths):
                 else:
                     f.write('gt_bm %s\n' % (gt_body_paths[bidx]))
 
+def process_batch(i, data, use_overlap_loss, res_out_path, device, args, use_joints2d, all_stage_loss_weights, pose_prior, motion_prior, init_motion_prior, im_dim, data_fps):
+    start_t = time.time()
+    # these dicts have different data depending on modality
+    # MUST have at least name
+    _data = prepare_data(data, use_overlap_loss, res_out_path).to(device)
+
+    # get body model
+    # load in from given path
+    Logger.log('Loading SMPL model from %s...' % (args.smpl))
+    body_model_path = args.smpl
+    fit_gender = body_model_path.split('/')[-2]
+    num_betas = 16 if 'betas' not in _data.gt_data else _data.gt_data['betas'].size(2)
+    body_model = BodyModel(bm_path=body_model_path,
+                            num_betas=num_betas,
+                            batch_size=_data.cur_batch_size*_data.T,
+                            use_vtx_selector=use_joints2d).to(device)
+
+    assert body_model.model_type == 'smplh', 'Only SMPL+H model is supported for HuMoR!'
+
+
+    save_info(args, _data.gt_data, _data.cur_res_out_paths)
+
+    # create optimizer
+    optimizer = MotionOptimizer(device,
+                                body_model,
+                                num_betas,
+                                _data.cur_batch_size,
+                                _data.T,
+                                [k for k in _data.observed_data.keys()],
+                                all_stage_loss_weights,
+                                pose_prior,
+                                motion_prior,
+                                init_motion_prior,
+                                use_joints2d,
+                                _data.cam_mat,
+                                args.robust_loss,
+                                args.robust_tuning_const,
+                                args.joint2d_sigma,
+                                stage3_tune_init_state=args.stage3_tune_init_state,
+                                stage3_tune_init_num_frames=args.stage3_tune_init_num_frames,
+                                stage3_tune_init_freeze_start=args.stage3_tune_init_freeze_start,
+                                stage3_tune_init_freeze_end=args.stage3_tune_init_freeze_end,
+                                stage3_contact_refine_only=args.stage3_contact_refine_only,
+                                use_chamfer=('points3d' in _data.observed_data),
+                                im_dim=im_dim)
+
+    # run optimizer
+    optim_result, per_stage_results = optimizer.run(_data.observed_data,
+                                                    data_fps=data_fps,
+                                                    lr=args.lr,
+                                                    num_iter=args.num_iters,
+                                                    lbfgs_max_iter=args.lbfgs_max_iter,
+                                                    stages_res_out=_data.cur_res_out_paths,
+                                                    fit_gender=fit_gender)
+
+    # save final results
+    if _data.cur_res_out_paths is not None:
+        _data.detach()
+        save_optim_result(_data.cur_res_out_paths, optim_result, per_stage_results, _data.gt_data.as_dict(), _data.observed_data.as_dict(), args.data_type,
+                            optim_floor=optimizer.optim_floor,
+                            obs_img_paths=_data.obs_img_paths,
+                            obs_mask_paths=_data.obs_mask_paths)
+
+    elapsed_t = time.time() - start_t
+    Logger.log('Optimized sequence %d in %f s' % (i, elapsed_t))
+
+    # cache last verts, floor, and betas from last batch index to use in consistency loss
+    #   for next batch
+    if use_overlap_loss:
+        prev_batch_overlap_res_dict = dict()
+        prev_batch_overlap_res_dict['verts3d'] = per_stage_results['stage3']['verts3d'][-1].clone().detach()
+        prev_batch_overlap_res_dict['betas'] = optim_result['betas'][-1].clone().detach()
+        prev_batch_overlap_res_dict['floor_plane'] = optim_result['floor_plane'][-1].clone().detach()
+        prev_batch_overlap_res_dict['seq_interval'] = _data.observed_data['seq_interval'][-1].clone().detach()
+
+    return _data
 
 def main(args, config_file):
     # set seed
@@ -395,95 +476,18 @@ def main(args, config_file):
             Logger.log('Could not find init motion state prior at given directory!')
             exit()
 
+    # process the data
     fit_errs = dict()
     prev_batch_overlap_res_dict = None
     use_overlap_loss = sum(loss_weights['rgb_overlap_consist']) > 0.0
     for i, data in enumerate(data_loader):
-        start_t = time.time()
-        # these dicts have different data depending on modality
-        # MUST have at least name
-        _data = prepare_data(data, use_overlap_loss, res_out_path).to(device)
-
-        # get body model
-        # load in from given path
-        Logger.log('Loading SMPL model from %s...' % (args.smpl))
-        body_model_path = args.smpl
-        fit_gender = body_model_path.split('/')[-2]
-        num_betas = 16 if 'betas' not in _data.gt_data else _data.gt_data['betas'].size(2)
-        body_model = BodyModel(bm_path=body_model_path,
-                                num_betas=num_betas,
-                                batch_size=_data.cur_batch_size*_data.T,
-                                use_vtx_selector=use_joints2d).to(device)
-
-        assert body_model.model_type == 'smplh', 'Only SMPL+H model is supported for HuMoR!'
-
-
-        save_info(args, _data.gt_data, _data.cur_res_out_paths)
-
-        # create optimizer
-        optimizer = MotionOptimizer(device,
-                                    body_model,
-                                    num_betas,
-                                    _data.cur_batch_size,
-                                    _data.T,
-                                    [k for k in _data.observed_data.keys()],
-                                    all_stage_loss_weights,
-                                    pose_prior,
-                                    motion_prior,
-                                    init_motion_prior,
-                                    use_joints2d,
-                                    _data.cam_mat,
-                                    args.robust_loss,
-                                    args.robust_tuning_const,
-                                    args.joint2d_sigma,
-                                    stage3_tune_init_state=args.stage3_tune_init_state,
-                                    stage3_tune_init_num_frames=args.stage3_tune_init_num_frames,
-                                    stage3_tune_init_freeze_start=args.stage3_tune_init_freeze_start,
-                                    stage3_tune_init_freeze_end=args.stage3_tune_init_freeze_end,
-                                    stage3_contact_refine_only=args.stage3_contact_refine_only,
-                                    use_chamfer=('points3d' in _data.observed_data),
-                                    im_dim=im_dim)
-
-        # run optimizer
-        optim_result, per_stage_results = optimizer.run(_data.observed_data,
-                                                        data_fps=data_fps,
-                                                        lr=args.lr,
-                                                        num_iter=args.num_iters,
-                                                        lbfgs_max_iter=args.lbfgs_max_iter,
-                                                        stages_res_out=_data.cur_res_out_paths,
-                                                        fit_gender=fit_gender)
-
-        # save final results
-        if cur_res_out_paths is not None:
-            save_optim_result(_data.cur_res_out_paths, optim_result, per_stage_results, _data.gt_data, _data.observed_data, args.data_type,
-                                optim_floor=optimizer.optim_floor,
-                                obs_img_paths=_data.obs_img_paths,
-                                obs_mask_paths=_data.obs_mask_paths)
-
-        elapsed_t = time.time() - start_t
-        Logger.log('Optimized sequence %d in %f s' % (i, elapsed_t))
-
-        # cache last verts, floor, and betas from last batch index to use in consistency loss
-        #   for next batch
-        if use_overlap_loss:
-            prev_batch_overlap_res_dict = dict()
-            prev_batch_overlap_res_dict['verts3d'] = per_stage_results['stage3']['verts3d'][-1].clone().detach()
-            prev_batch_overlap_res_dict['betas'] = optim_result['betas'][-1].clone().detach()
-            prev_batch_overlap_res_dict['floor_plane'] = optim_result['floor_plane'][-1].clone().detach()
-            prev_batch_overlap_res_dict['seq_interval'] = _data.observed_data['seq_interval'][-1].clone().detach()
-
-        if i < (len(data_loader) - 1):
-            del optimizer
-        del body_model
-        del _data.observed_data
-        del _data.gt_data
-        torch.cuda.empty_cache()
+        _data = process_batch(i, data, use_overlap_loss, res_out_path, device, args, use_joints2d, all_stage_loss_weights, pose_prior, motion_prior, init_motion_prior, im_dim, data_fps)
 
     # if RGB video, stitch together subsequences
     if args.data_type == 'RGB' and args.save_results:
         Logger.log('Saving final results...')
         seq_intervals = dataset.seq_intervals
-        save_rgb_stitched_result(seq_intervals, cur_res_out_paths, res_out_path, device,
+        save_rgb_stitched_result(seq_intervals, _data.cur_res_out_paths, _data.res_out_path, device,
                                  body_model_path, num_betas, use_joints2d)
 
 
