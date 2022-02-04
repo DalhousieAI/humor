@@ -1,4 +1,5 @@
 import time, os
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1324,10 +1325,89 @@ class HumorModel(nn.Module):
 
         return out_dict
 
+    def format_frame(self, global_seq, t, trans2joint, world2aligned_rot=None, world2aligned_trans=None):
+
+        v = global_seq[list(global_seq.keys())[0]]
+        B, T, _ = v.size()
+        J = len(SMPL_JOINTS)
+
+        needed_future_steps = (self.steps_out - 1) * self.out_step_size
+
+        root_orient_mat = global_seq["root_orient"][:, t, :].reshape((B, 3, 3))
+        world2aligned_rot = compute_world2aligned_mat(root_orient_mat)
+        world2aligned_trans = torch.cat(
+            [
+                -global_seq["trans"][:, t, :2],
+                torch.zeros((B, 1)).to(root_orient_mat),
+            ],
+            axis=1,
+        )
+
+        # compute trans2joint at first step
+        if t == 0 and self.need_trans2joint:
+            trans2joint = -(
+                global_seq["joints"][:, t, :2] + world2aligned_trans[:, :2]
+            )  # we cannot make the assumption that the first frame is already canonical
+            trans2joint = torch.cat(
+                [trans2joint, torch.zeros((B, 1)).to(trans2joint)], axis=1
+            ).reshape((B, 1, 1, 3))
+
+        # get current window
+        cur_data_dict = dict()
+        for k in global_seq.keys():
+            # get in steps
+            in_sidx = max(0, t - self.steps_in + 1)
+            cur_in_seq = global_seq[k][:, in_sidx : (t + 1), :]
+            if cur_in_seq.size(1) < self.steps_in:
+                # must zero pad front
+                num_pad_steps = self.steps_in - cur_in_seq.size(1)
+                cur_padding = torch.zeros(
+                    (cur_in_seq.size(0), num_pad_steps, cur_in_seq.size(2))
+                ).to(
+                    cur_in_seq
+                )  # assuming all data is B x T x D
+                cur_in_seq = torch.cat([cur_padding, cur_in_seq], axis=1)
+
+            # get out steps
+            cur_out_seq = global_seq[k][
+                :, (t + 1) : (t + 2 + needed_future_steps) : self.out_step_size
+            ]
+            if cur_out_seq.size(1) < self.steps_out:
+                # zero pad
+                num_pad_steps = self.steps_out - cur_out_seq.size(1)
+                cur_padding = torch.zeros_like(cur_out_seq[:, 0])
+                cur_padding = torch.stack([cur_padding] * num_pad_steps, axis=1)
+                cur_out_seq = torch.cat([cur_out_seq, cur_padding], axis=1)
+            cur_data_dict[k] = torch.cat([cur_in_seq, cur_out_seq], axis=1)
+
+        # transform to local frame
+        cur_data_dict = self.apply_world2local_trans(
+            world2aligned_trans,
+            world2aligned_rot,
+            trans2joint,
+            cur_data_dict,
+            cur_data_dict,
+            invert=False,
+        )
+
+        # create x_past and x_t
+        # cat all inputs together to form past_in
+        in_data_list = []
+        for k in self.data_names:
+            in_data_list.append(cur_data_dict[k][:, : self.steps_in, :])
+        x_past = torch.cat(in_data_list, axis=2)
+        # cat all outputs together to form x_t
+        out_data_list = []
+        for k in self.data_names:
+            out_data_list.append(cur_data_dict[k][:, self.steps_in :, :])
+        x_t = torch.cat(out_data_list, axis=2)
+
+        return x_past, x_t, trans2joint
+
     def infer_global_seq(self, global_seq, full_forward_pass=False):
         """
         Given a sequence of global states, formats it (transform each step into
-        local frame and makde B x steps_in x D) and runs inference (compute
+        local frame and make B x steps_in x D) and runs inference (compute
         prior/posterior of z for the sequence).
 
         If full_forward_pass is true, does an entire forward pass at each step
@@ -1337,101 +1417,41 @@ class HumorModel(nn.Module):
         """
         assert not full_forward_pass
         # used to compute output zero padding
-        needed_future_steps = (self.steps_out - 1) * self.out_step_size
 
-        prior_m_seq = []
-        prior_v_seq = []
-        post_m_seq = []
-        post_v_seq = []
-        pred_dict_seq = []
-        B, T, _ = global_seq[list(global_seq.keys())[0]].size()
-        J = len(SMPL_JOINTS)
+        class InferState:
+            prior_m_seq: list = []
+            prior_v_seq: list = []
+            post_m_seq: list = []
+            post_v_seq: list = []
+            pred_dict_seq: list = []
+
+            def append(self, prior_m, prior_v, post_m, post_v):
+                self.prior_m_seq.append(prior_m)
+                self.prior_v_seq.append(prior_v)
+                self.post_m_seq.append(post_m)
+                self.post_v_seq.append(post_v)
+
+            def stack(self):
+                self.prior_m_seq = torch.stack(self.prior_m_seq, axis=1)
+                self.prior_v_seq = torch.stack(self.prior_v_seq, axis=1)
+                self.post_m_seq = torch.stack(self.post_m_seq, axis=1)
+                self.post_v_seq = torch.stack(self.post_v_seq, axis=1)
+
+        v = global_seq[list(global_seq.keys())[0]]
+        _, T, _ = v.size()
+
+        infer_state = InferState()
         trans2joint = None
         for t in range(T - 1):
-            # get world2aligned rot and translation
-            world2aligned_rot = world2aligned_trans = None
-
-            root_orient_mat = global_seq["root_orient"][:, t, :].reshape((B, 3, 3))
-            world2aligned_rot = compute_world2aligned_mat(root_orient_mat)
-            world2aligned_trans = torch.cat(
-                [
-                    -global_seq["trans"][:, t, :2],
-                    torch.zeros((B, 1)).to(root_orient_mat),
-                ],
-                axis=1,
-            )
-
-            # compute trans2joint at first step
-            if t == 0 and self.need_trans2joint:
-                trans2joint = -(
-                    global_seq["joints"][:, t, :2] + world2aligned_trans[:, :2]
-                )  # we cannot make the assumption that the first frame is already canonical
-                trans2joint = torch.cat(
-                    [trans2joint, torch.zeros((B, 1)).to(trans2joint)], axis=1
-                ).reshape((B, 1, 1, 3))
-
-            # get current window
-            cur_data_dict = dict()
-            for k in global_seq.keys():
-                # get in steps
-                in_sidx = max(0, t - self.steps_in + 1)
-                cur_in_seq = global_seq[k][:, in_sidx : (t + 1), :]
-                if cur_in_seq.size(1) < self.steps_in:
-                    # must zero pad front
-                    num_pad_steps = self.steps_in - cur_in_seq.size(1)
-                    cur_padding = torch.zeros(
-                        (cur_in_seq.size(0), num_pad_steps, cur_in_seq.size(2))
-                    ).to(
-                        cur_in_seq
-                    )  # assuming all data is B x T x D
-                    cur_in_seq = torch.cat([cur_padding, cur_in_seq], axis=1)
-
-                # get out steps
-                cur_out_seq = global_seq[k][
-                    :, (t + 1) : (t + 2 + needed_future_steps) : self.out_step_size
-                ]
-                if cur_out_seq.size(1) < self.steps_out:
-                    # zero pad
-                    num_pad_steps = self.steps_out - cur_out_seq.size(1)
-                    cur_padding = torch.zeros_like(cur_out_seq[:, 0])
-                    cur_padding = torch.stack([cur_padding] * num_pad_steps, axis=1)
-                    cur_out_seq = torch.cat([cur_out_seq, cur_padding], axis=1)
-                cur_data_dict[k] = torch.cat([cur_in_seq, cur_out_seq], axis=1)
-
             # transform to local frame
-            cur_data_dict = self.apply_world2local_trans(
-                world2aligned_trans,
-                world2aligned_rot,
-                trans2joint,
-                cur_data_dict,
-                cur_data_dict,
-                invert=False,
-            )
-
-            # create x_past and x_t
-            # cat all inputs together to form past_in
-            in_data_list = []
-            for k in self.data_names:
-                in_data_list.append(cur_data_dict[k][:, : self.steps_in, :])
-            x_past = torch.cat(in_data_list, axis=2)
-            # cat all outputs together to form x_t
-            out_data_list = []
-            for k in self.data_names:
-                out_data_list.append(cur_data_dict[k][:, self.steps_in :, :])
-            x_t = torch.cat(out_data_list, axis=2)
+            x_past, x_t, trans2joint = self.format_frame(global_seq, t, trans2joint)
 
             # perform inference
             prior_z, posterior_z = self.infer(x_past, x_t)
             # save z
-            prior_m_seq.append(prior_z[0])
-            prior_v_seq.append(prior_z[1])
-            post_m_seq.append(posterior_z[0])
-            post_v_seq.append(posterior_z[1])
+            infer_state.append(prior_z[0], prior_z[1], posterior_z[0], posterior_z[1])
 
-        prior_m_seq = torch.stack(prior_m_seq, axis=1)
-        prior_v_seq = torch.stack(prior_v_seq, axis=1)
-        post_m_seq = torch.stack(post_m_seq, axis=1)
-        post_v_seq = torch.stack(post_v_seq, axis=1)
+        infer_state.stack()
 
         return (prior_m_seq, prior_v_seq), (post_m_seq, post_v_seq)
 
