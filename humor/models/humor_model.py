@@ -1037,21 +1037,26 @@ class HumorModel(nn.Module):
         canonicalize_input=False,
     ):
         """
-        Given input for first step, roll out using own output the entire time by sampling from the prior.
+        Given input for first step, roll out using own output the entire time
+        by sampling from the prior.
         Returns the global trajectory.
 
         Input:
         - x_past (B x steps_in x D_in)
-        - initial_input_dict : dictionary of each initial state (B x steps_in x D), rotations should be matrices
-                                (assumes initial state is already in its local coordinate system (translation at [0,0,z] and aligned))
+        - initial_input_dict : dictionary of each initial state (B x steps_in x D),
+          rotations should be matrices (assumes initial state is already in its
+          local coordinate system (translation at [0,0,z] and aligned))
         - num_steps : the number of timesteps to roll out
         - use_mean : if True, uses the mean of latent distribution instead of sampling
-        - z_seq : (B x steps_out x D) if given, uses as the latent input to decoder at each step rather than sampling
-        - return_prior : if True, also returns the output of the conditional prior at each step
+        - z_seq : (B x steps_out x D) if given, uses as the latent input to
+          decoder at each step rather than sampling
+        - return_prior : if True, also returns the output of the conditional
+          prior at each step
         -gender : list of e.g. ['male', 'female', etc..] of length B
         -betas : B x steps_in x D
         -return_z : returns the sampled z sequence in addition to the output
-        - canonicalize_input : if true, the input initial state is assumed to not be in the local aligned coordinate system. It will be transformed before using.
+        - canonicalize_input : if true, the input initial state is assumed to
+          not be in the local aligned coordinate system. It will be transformed before using.
 
         Returns:
         - x_pred - dict of (B x num_steps x D_out) for each value. Rotations are all matrices.
@@ -1060,48 +1065,7 @@ class HumorModel(nn.Module):
         cur_input_dict = init_input_dict
 
         # need to transform init input to local frame
-        if canonicalize_input:
-            B, _, _ = cur_input_dict[list(cur_input_dict.keys())[0]].size()
-            # must transform initial input into the local frame
-            # get world2aligned rot and translation
-            world2aligned_rot = world2aligned_trans = None
-            root_orient_mat = cur_input_dict["root_orient"]
-            pose_body_mat = cur_input_dict["pose_body"]
-            if "root_orient" in self.data_names and self.in_rot_rep != "mat":
-                root_orient_mat = convert_to_rotmat(
-                    root_orient_mat, rep=self.in_rot_rep
-                )
-            if "pose_body" in self.data_names and self.in_rot_rep != "mat":
-                pose_body_mat = convert_to_rotmat(pose_body_mat, rep=self.in_rot_rep)
-
-            root_orient_mat = root_orient_mat[:, -1].reshape((B, 3, 3))
-            world2aligned_rot = compute_world2aligned_mat(root_orient_mat)
-            world2aligned_trans = torch.cat(
-                [
-                    -cur_input_dict["trans"][:, -1, :2],
-                    torch.zeros((B, 1)).to(root_orient_mat),
-                ],
-                axis=1,
-            )
-
-            # compute trans2joint
-            if self.need_trans2joint:
-                trans2joint = -(
-                    cur_input_dict["joints"][:, -1, :2] + world2aligned_trans[:, :2]
-                )
-                trans2joint = torch.cat(
-                    [trans2joint, torch.zeros((B, 1)).to(trans2joint)], axis=1
-                ).reshape((B, 1, 1, 3))
-
-            # transform to local frame
-            cur_input_dict = self.apply_world2local_trans(
-                world2aligned_trans,
-                world2aligned_rot,
-                trans2joint,
-                cur_input_dict,
-                cur_input_dict,
-                invert=False,
-            )
+        assert not canonicalize_input
 
         # check to make sure we have enough input steps, if not, pad
         pad_x_past = x_past is not None and x_past.size(1) < self.steps_in
@@ -1182,66 +1146,7 @@ class HumorModel(nn.Module):
 
             # output is the actual regressed joints, but input to next step can use smpl joints
             x_pred_smpl_joints = None
-            if self.use_smpl_joint_inputs and gender is not None and betas is not None:
-                # this assumes the model is actually outputting everything we need to run SMPL
-                # also assumes single output step
-                smpl_trans = x_pred_dict["trans"].reshape((B, 3))
-                smpl_root_orient = rotation_matrix_to_angle_axis(
-                    x_pred_dict["root_orient"].reshape((B, 3, 3))
-                ).reshape((B, 3))
-                smpl_betas = betas[:, 0, :]
-                smpl_pose_body = rotation_matrix_to_angle_axis(
-                    x_pred_dict["pose_body"].reshape((B * (J - 1), 3, 3))
-                ).reshape((B, (J - 1) * 3))
-
-                smpl_vals = [smpl_trans, smpl_root_orient, smpl_betas, smpl_pose_body]
-                # each batch index may be a different gender
-                gender_names = ["male", "female", "neutral"]
-                pred_joints = []
-                prev_nbidx = 0
-                cat_idx_map = np.ones((B), dtype=np.int) * -1
-                for gender_name in gender_names:
-                    gender_idx = np.array(gender) == gender_name
-                    nbidx = np.sum(gender_idx)
-                    cat_idx_map[gender_idx] = np.arange(
-                        prev_nbidx, prev_nbidx + nbidx, dtype=np.int
-                    )
-                    prev_nbidx += nbidx
-
-                    gender_smpl_vals = [val[gender_idx] for val in smpl_vals]
-
-                    # need to pad extra frames with zeros in case not as long as expected
-                    pad_size = self.smpl_batch_size - nbidx
-                    if pad_size == B:
-                        # skip if no frames for this gender
-                        continue
-                    pad_list = gender_smpl_vals
-                    if pad_size < 0:
-                        raise Exception(
-                            "SMPL model batch size not large enough to accomodate!"
-                        )
-                    elif pad_size > 0:
-                        pad_list = self.zero_pad_tensors(pad_list, pad_size)
-
-                    # reconstruct SMPL
-                    cur_pred_trans, cur_pred_orient, cur_betas, cur_pred_pose = pad_list
-                    bm = self.bm_dict[gender_name]
-                    pred_body = bm(
-                        pose_body=cur_pred_pose,
-                        betas=cur_betas,
-                        root_orient=cur_pred_orient,
-                        trans=cur_pred_trans,
-                    )
-                    if pad_size > 0:
-                        pred_joints.append(pred_body.Jtr[:-pad_size])
-                    else:
-                        pred_joints.append(pred_body.Jtr)
-
-                # cat all genders and reorder to original batch ordering
-                x_pred_smpl_joints = torch.cat(pred_joints, axis=0)[
-                    :, : len(SMPL_JOINTS), :
-                ].reshape((B, 1, -1))
-                x_pred_smpl_joints = x_pred_smpl_joints[cat_idx_map]
+            assert not self.use_smpl_joint_inputs
 
             # prepare input to next step
             # update input dict with new frame
@@ -1421,13 +1326,16 @@ class HumorModel(nn.Module):
 
     def infer_global_seq(self, global_seq, full_forward_pass=False):
         """
-        Given a sequence of global states, formats it (transform each step into local frame and makde B x steps_in x D)
-        and runs inference (compute prior/posterior of z for the sequence).
+        Given a sequence of global states, formats it (transform each step into
+        local frame and makde B x steps_in x D) and runs inference (compute
+        prior/posterior of z for the sequence).
 
-        If full_forward_pass is true, does an entire forward pass at each step rather than just inference.
+        If full_forward_pass is true, does an entire forward pass at each step
+        rather than just inference.
 
         Rotations should be in in_rot_rep format.
         """
+        assert not full_forward_pass
         # used to compute output zero padding
         needed_future_steps = (self.steps_out - 1) * self.out_step_size
 
@@ -1512,46 +1420,20 @@ class HumorModel(nn.Module):
                 out_data_list.append(cur_data_dict[k][:, self.steps_in :, :])
             x_t = torch.cat(out_data_list, axis=2)
 
-            if full_forward_pass:
-                x_pred_dict = self(x_past, x_t)
-                pred_dict_seq.append(x_pred_dict)
-            else:
-                # perform inference
-                prior_z, posterior_z = self.infer(x_past, x_t)
-                # save z
-                prior_m_seq.append(prior_z[0])
-                prior_v_seq.append(prior_z[1])
-                post_m_seq.append(posterior_z[0])
-                post_v_seq.append(posterior_z[1])
+            # perform inference
+            prior_z, posterior_z = self.infer(x_past, x_t)
+            # save z
+            prior_m_seq.append(prior_z[0])
+            prior_v_seq.append(prior_z[1])
+            post_m_seq.append(posterior_z[0])
+            post_v_seq.append(posterior_z[1])
 
-        if full_forward_pass:
-            # pred_dict_seq
-            pred_seq_out = dict()
-            for k in pred_dict_seq[0].keys():
-                # print(k)
-                if k == "posterior_distrib" or k == "prior_distrib":
-                    m = torch.stack(
-                        [pred_dict_seq[i][k][0] for i in range(len(pred_dict_seq))],
-                        axis=1,
-                    )
-                    v = torch.stack(
-                        [pred_dict_seq[i][k][1] for i in range(len(pred_dict_seq))],
-                        axis=1,
-                    )
-                    pred_seq_out[k] = (m, v)
-                else:
-                    pred_seq_out[k] = torch.stack(
-                        [pred_dict_seq[i][k] for i in range(len(pred_dict_seq))], axis=1
-                    )
+        prior_m_seq = torch.stack(prior_m_seq, axis=1)
+        prior_v_seq = torch.stack(prior_v_seq, axis=1)
+        post_m_seq = torch.stack(post_m_seq, axis=1)
+        post_v_seq = torch.stack(post_v_seq, axis=1)
 
-            return pred_seq_out
-        else:
-            prior_m_seq = torch.stack(prior_m_seq, axis=1)
-            prior_v_seq = torch.stack(prior_v_seq, axis=1)
-            post_m_seq = torch.stack(post_m_seq, axis=1)
-            post_v_seq = torch.stack(post_v_seq, axis=1)
-
-            return (prior_m_seq, prior_v_seq), (post_m_seq, post_v_seq)
+        return (prior_m_seq, prior_v_seq), (post_m_seq, post_v_seq)
 
     def infer(self, x_past, x_t):
         """

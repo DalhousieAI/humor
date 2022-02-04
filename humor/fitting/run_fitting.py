@@ -130,6 +130,8 @@ def prepare_data(data, use_overlap_loss, res_out_path):
             return getattr(self, item)
         def keys(self):
             return self._keys
+        def items(self):
+            return [(k, getattr(self, k)) for k in self._keys]
         def as_dict(self):
             return {k : getattr(self, k) for k in self._keys}
         def __contains__(self, item):
@@ -402,30 +404,6 @@ def main(args, config_file):
         # MUST have at least name
         _data = prepare_data(data, use_overlap_loss, res_out_path).to(device)
 
-        state_pkl = 'run_fitting_debug_state.pkl'
-        dump_state = False
-        if dump_state:
-            if Path(state_pkl).exists():
-                raise Exception('State file already exists!')
-            with open(state_pkl, 'wb') as f:
-                state = {}
-                def is_pickleable(x):
-                    try:
-                        pickle.dumps(x)
-                        return True
-                    except:
-                        return False
-                for k, v in locals().items():
-                    if is_pickleable(v):
-                        state[k] = v
-                pickle.dump(state, f)
-        else:
-            with open(state_pkl, 'rb') as f:
-                state = pickle.load(f)
-
-        assert _data.cur_batch_size == state['cur_batch_size']
-        assert _data.T == state['T']
-
         # get body model
         # load in from given path
         Logger.log('Loading SMPL model from %s...' % (args.smpl))
@@ -477,10 +455,10 @@ def main(args, config_file):
 
         # save final results
         if cur_res_out_paths is not None:
-            save_optim_result(cur_res_out_paths, optim_result, per_stage_results, _data.gt_data, _data.observed_data, args.data_type,
+            save_optim_result(_data.cur_res_out_paths, optim_result, per_stage_results, _data.gt_data, _data.observed_data, args.data_type,
                                 optim_floor=optimizer.optim_floor,
-                                obs_img_paths=obs_img_paths,
-                                obs_mask_paths=obs_mask_paths)
+                                obs_img_paths=_data.obs_img_paths,
+                                obs_mask_paths=_data.obs_mask_paths)
 
         elapsed_t = time.time() - start_t
         Logger.log('Optimized sequence %d in %f s' % (i, elapsed_t))

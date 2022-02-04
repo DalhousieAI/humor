@@ -154,6 +154,8 @@ class MotionOptimizer:
         stages_res_out=None,
         fit_gender="neutral",
     ):
+        assert not self.motion_prior.in_rot_rep == "6d"
+        assert not self.motion_prior.use_smpl_joint_inputs
 
         assert len(num_iter) == 3
 
@@ -729,25 +731,21 @@ class MotionOptimizer:
         """
         B, T, _ = trans.size()
         h = 1.0 / data_fps
-        if self.motion_prior.model_data_config in [
+        assert self.motion_prior.model_data_config in [
             "smpl+joints",
             "smpl+joints+contacts",
-        ]:
-            if smpl_results is None:
-                smpl_results, _ = self.smpl_results(
-                    trans, root_orient, body_pose, betas
-                )
-            trans_vel = self.estimate_linear_velocity(trans, h)
-            joints_vel = self.estimate_linear_velocity(smpl_results["joints3d"], h)
-            root_orient_mat = batch_rodrigues(root_orient.reshape((-1, 3))).reshape(
-                (B, T, 3, 3)
+        ]
+        if smpl_results is None:
+            smpl_results, _ = self.smpl_results(
+                trans, root_orient, body_pose, betas
             )
-            root_orient_vel = self.estimate_angular_velocity(root_orient_mat, h)
-            return trans_vel, joints_vel, root_orient_vel
-        else:
-            raise NotImplementedError(
-                "Only smpl+joints motion prior configuration is supported!"
-            )
+        trans_vel = self.estimate_linear_velocity(trans, h)
+        joints_vel = self.estimate_linear_velocity(smpl_results["joints3d"], h)
+        root_orient_mat = batch_rodrigues(root_orient.reshape((-1, 3))).reshape(
+            (B, T, 3, 3)
+        )
+        root_orient_vel = self.estimate_angular_velocity(root_orient_mat, h)
+        return trans_vel, joints_vel, root_orient_vel
 
     def estimate_linear_velocity(self, data_seq, h):
         """
@@ -792,105 +790,65 @@ class MotionOptimizer:
         """
         By default, gets a sequence of z's from the current SMPL optim params.
 
-        If full_forward_pass is true, in addition to inference, also samples from the posterior and feeds
-        through the motion prior decoder to get all terms needed to calculate the ELBO.
+        If full_forward_pass is true, in addition to inference, also samples
+        from the posterior and feeds through the motion prior decoder to get
+        all terms needed to calculate the ELBO.
         """
         B, T, _ = trans.size()
         h = 1.0 / data_fps
         latent_motion = None
-        if self.motion_prior.model_data_config in [
+        assert self.motion_prior.model_data_config in [
             "smpl+joints",
             "smpl+joints+contacts",
-        ]:
-            if self.optim_floor:
-                # need to first transform into canonical coordinate frame
-                data_dict = {"trans": trans, "root_orient": root_orient}
-                prior_data_dict = self.apply_cam2prior(
-                    data_dict,
-                    self.cam2prior_R,
-                    self.cam2prior_t,
-                    self.cam2prior_root_height,
-                    body_pose,
-                    betas,
-                    self.init_fidx,
-                )
-                trans = prior_data_dict["trans"]
-                root_orient = prior_data_dict["root_orient"]
+        ]
+        assert not self.optim_floor
 
-            smpl_results, _ = self.smpl_results(trans, root_orient, body_pose, betas)
-            trans_vel, joints_vel, root_orient_vel = self.estimate_velocities(
-                trans,
-                root_orient,
-                body_pose,
-                betas,
-                data_fps,
-                smpl_results=smpl_results,
-            )
+        smpl_results, _ = self.smpl_results(trans, root_orient, body_pose, betas)
+        trans_vel, joints_vel, root_orient_vel = self.estimate_velocities(
+            trans,
+            root_orient,
+            body_pose,
+            betas,
+            data_fps,
+            smpl_results=smpl_results,
+        )
 
-            joints = smpl_results["joints3d"]
+        joints = smpl_results["joints3d"]
 
-            # convert rots
-            # body pose and root orient are both in aa
-            root_orient_in = root_orient
-            body_pose_in = body_pose
-            if (
-                self.motion_prior.in_rot_rep == "mat"
-                or self.motion_prior.in_rot_rep == "6d"
-            ):
-                root_orient_in = batch_rodrigues(root_orient.reshape(-1, 3)).reshape(
-                    (B, T, 9)
-                )
-                body_pose_in = batch_rodrigues(body_pose.reshape(-1, 3)).reshape(
-                    (B, T, J_BODY * 9)
-                )
-            if self.motion_prior.in_rot_rep == "6d":
-                root_orient_in = root_orient_in[:, :, :6]
-                body_pose_in = body_pose_in.reshape((B, T, J_BODY, 9))[
-                    :, :, :, :6
-                ].reshape((B, T, J_BODY * 6))
-            joints_in = joints.reshape((B, T, -1))
-            joints_vel_in = joints_vel.reshape((B, T, -1))
+        # convert rots
+        # body pose and root orient are both in aa
+        root_orient_in = root_orient
+        body_pose_in = body_pose
+        assert (
+            self.motion_prior.in_rot_rep == "mat"
+            or self.motion_prior.in_rot_rep == "6d"
+        )
+        root_orient_in = batch_rodrigues(root_orient.reshape(-1, 3)).reshape(
+            (B, T, 9)
+        )
+        body_pose_in = batch_rodrigues(body_pose.reshape(-1, 3)).reshape(
+            (B, T, J_BODY * 9)
+        )
+        assert not self.motion_prior.in_rot_rep == "6d"
+        joints_in = joints.reshape((B, T, -1))
+        joints_vel_in = joints_vel.reshape((B, T, -1))
 
-            seq_dict = {
-                "trans": trans,
-                "trans_vel": trans_vel,
-                "root_orient": root_orient_in,
-                "root_orient_vel": root_orient_vel,
-                "pose_body": body_pose_in,
-                "joints": joints_in,
-                "joints_vel": joints_vel_in,
-            }
+        seq_dict = {
+            "trans": trans,
+            "trans_vel": trans_vel,
+            "root_orient": root_orient_in,
+            "root_orient_vel": root_orient_vel,
+            "pose_body": body_pose_in,
+            "joints": joints_in,
+            "joints_vel": joints_vel_in,
+        }
 
-            infer_results = self.motion_prior.infer_global_seq(
-                seq_dict, full_forward_pass=full_forward_pass
-            )
-            if full_forward_pass:
-                # return both the given motion and the one from the forward pass
-                # make sure rotations are matrix
-                # NOTE: assumes seq_dict is same thing we want to compute loss on - need to change if multiple future steps.
-                if self.motion_prior.in_rot_rep != "mat":
-                    seq_dict["trans"] = batch_rodrigues(
-                        root_orient.reshape(-1, 3)
-                    ).reshape((B, T, 9))
-                    seq_dict["pose_body"] = batch_rodrigues(
-                        body_pose.reshape(-1, 3)
-                    ).reshape((B, T, J_BODY * 9))
-                # do not need initial step anymore since output will be T-1
-                for k, v in seq_dict.items():
-                    seq_dict[k] = v[:, 1:]
-                for k in infer_results.keys():
-                    if k != "posterior_distrib" and k != "prior_distrib":
-                        infer_results[k] = infer_results[k][
-                            :, :, 0
-                        ]  # only want first output step
-                infer_results = (seq_dict, infer_results)
-            else:
-                prior_z, posterior_z = infer_results
-                infer_results = posterior_z[0]  # mean of the approximate posterior
-        else:
-            raise NotImplementedError(
-                "Only smpl+joints motion prior configuration is supported!"
-            )
+        infer_results = self.motion_prior.infer_global_seq(
+            seq_dict, full_forward_pass=full_forward_pass
+        )
+        assert not full_forward_pass
+        prior_z, posterior_z = infer_results
+        infer_results = posterior_z[0]  # mean of the approximate posterior
 
         return infer_results
 
@@ -928,65 +886,48 @@ class MotionOptimizer:
 
         cam_trans = trans
         cam_root_orient = root_orient
-        if self.optim_floor:
-            # need to first transform initial state into canonical coordinate frame
-            data_dict = {"trans": trans, "root_orient": root_orient}
-            prior_data_dict = self.apply_cam2prior(
-                data_dict,
-                self.cam2prior_R,
-                self.cam2prior_t,
-                self.cam2prior_root_height,
-                body_pose,
-                betas,
-                self.init_fidx,
-            )
-            trans = prior_data_dict["trans"]
-            root_orient = prior_data_dict["root_orient"]
+        assert not self.optim_floor
 
         x_past = joints = None
         trans_vel = joints_vel = root_orient_vel = None
         rollout_in_dict = dict()
-        if self.motion_prior.model_data_config in [
+        assert self.motion_prior.model_data_config in [
             "smpl+joints",
             "smpl+joints+contacts",
-        ]:
-            trans_vel, joints_vel, root_orient_vel = prior_opt_params
-            smpl_results, _ = self.smpl_results(trans, root_orient, body_pose, betas)
-            joints = smpl_results["joints3d"]
-            # update to correct rotations for input
-            root_orient_in = root_orient
-            body_pose_in = body_pose
-            if (
-                self.motion_prior.in_rot_rep == "mat"
-                or self.motion_prior.in_rot_rep == "6d"
-            ):
-                root_orient_in = batch_rodrigues(root_orient.reshape(-1, 3)).reshape(
-                    (B, 1, 9)
-                )
-                body_pose_in = batch_rodrigues(body_pose.reshape(-1, 3)).reshape(
-                    (B, 1, J_BODY * 9)
-                )
-            if self.motion_prior.in_rot_rep == "6d":
-                root_orient_in = root_orient_in[:, :, :6]
-                body_pose_in = body_pose_in.reshape((B, 1, J_BODY, 9))[
-                    :, :, :, :6
-                ].reshape((B, 1, J_BODY * 6))
-            joints_in = joints.reshape((B, 1, -1))
-            joints_vel_in = joints_vel.reshape((B, 1, -1))
-
-            rollout_in_dict = {
-                "trans": trans,
-                "trans_vel": trans_vel,
-                "root_orient": root_orient_in,
-                "root_orient_vel": root_orient_vel,
-                "pose_body": body_pose_in,
-                "joints": joints_in,
-                "joints_vel": joints_vel_in,
-            }
-        else:
-            raise NotImplementedError(
-                "Only smpl+joints motion prior configuration is supported!"
+        ]
+        trans_vel, joints_vel, root_orient_vel = prior_opt_params
+        smpl_results, _ = self.smpl_results(trans, root_orient, body_pose, betas)
+        joints = smpl_results["joints3d"]
+        # update to correct rotations for input
+        root_orient_in = root_orient
+        body_pose_in = body_pose
+        if (
+            self.motion_prior.in_rot_rep == "mat"
+            or self.motion_prior.in_rot_rep == "6d"
+        ):
+            root_orient_in = batch_rodrigues(root_orient.reshape(-1, 3)).reshape(
+                (B, 1, 9)
             )
+            body_pose_in = batch_rodrigues(body_pose.reshape(-1, 3)).reshape(
+                (B, 1, J_BODY * 9)
+            )
+        if self.motion_prior.in_rot_rep == "6d":
+            root_orient_in = root_orient_in[:, :, :6]
+            body_pose_in = body_pose_in.reshape((B, 1, J_BODY, 9))[
+                :, :, :, :6
+            ].reshape((B, 1, J_BODY * 6))
+        joints_in = joints.reshape((B, 1, -1))
+        joints_vel_in = joints_vel.reshape((B, 1, -1))
+
+        rollout_in_dict = {
+            "trans": trans,
+            "trans_vel": trans_vel,
+            "root_orient": root_orient_in,
+            "root_orient_vel": root_orient_vel,
+            "pose_body": body_pose_in,
+            "joints": joints_in,
+            "joints_vel": joints_vel_in,
+        }
 
         roll_output = self.motion_prior.roll_out(
             None,
