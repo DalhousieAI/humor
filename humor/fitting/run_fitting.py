@@ -11,10 +11,13 @@ cur_file_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(cur_file_path, '..'))
 
 import importlib, time, math, shutil, json
+import pickle
+from pathlib import Path
 
 import numpy as np
 
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from utils.logging import Logger, cp_files
 
@@ -34,7 +37,147 @@ from utils.video import video_to_images, run_openpose, run_deeplab_v3
 from body_model.body_model import BodyModel
 from body_model.utils import SMPLX_PATH, SMPLH_PATH
 
+def prepare_data(data, use_overlap_loss, res_out_path):
+    # these dicts have different data depending on modality
+    # MUST have at least name
+    observed_data, gt_data = data
+    # both of these are a list of tuples, each list index is a frame and the tuple index is the seq within the batch
+    obs_img_paths = None if 'img_paths' not in observed_data else observed_data['img_paths']
+    obs_mask_paths = None if 'mask_paths' not in observed_data else observed_data['mask_paths']
+    # observed_data = {k : v.to(device) for k, v in observed_data.items() if isinstance(v, torch.Tensor)}
+    # for k, v in gt_data.items():
+    #    if isinstance(v, torch.Tensor):
+    #        gt_data[k] = v.to(device)
+    cur_batch_size = observed_data[list(observed_data.keys())[0]].size(0)
+    T = observed_data[list(observed_data.keys())[0]].size(1)
+
+    if use_overlap_loss and 'seq_interval' not in observed_data:
+        print('Must have frame index labels from data to determine overlap')
+        exit()
+
+    if cur_batch_size == 3:
+        # NOTE: hacky way to avoid bug with pytorch 3x3 matmul problems with batch size 3....
+        for k, v in observed_data.items():
+            if isinstance(v, torch.Tensor):
+                observed_data[k] = torch.cat([v, v[-1:]], dim=0)
+            else:
+                # otherwise it's a list
+                observed_data[k] = v + [v[-1]]
+        for k, v in gt_data.items():
+            if isinstance(v, torch.Tensor):
+                gt_data[k] = torch.cat([v, v[-1:]], dim=0)
+            else:
+                # otherwise it's a list
+                gt_data[k] = v + [v[-1]]
+                if k == 'name':
+                    # change name so we don't overwrite
+                    gt_data[k][-1] = gt_data[k][-1] + '_copy'
+
+        # obs_img_paths and obs_mask_paths
+        if obs_img_paths is not None:
+            new_obs_img_paths = []
+            for img_paths in obs_img_paths:
+                new_obs_img_paths.append(img_paths + [img_paths[-1]])
+            obs_img_paths = new_obs_img_paths
+        if obs_mask_paths is not None:
+            new_obs_mask_paths = []
+            for mask_paths in obs_mask_paths:
+                new_obs_mask_paths.append(mask_paths + [mask_paths[-1]])
+            obs_mask_paths = new_obs_mask_paths
+
+        cur_batch_size = 4
+
+    # pass in the last batch index from previous batch is using overlap consistency
+    if use_overlap_loss and prev_batch_overlap_res_dict is not None:
+        observed_data['prev_batch_overlap_res'] = prev_batch_overlap_res_dict
+
+    seq_names = []
+    for gt_idx, gt_name in enumerate(gt_data['name']):
+        seq_name = gt_name + '_' + str(int(time.time())) + str(gt_idx)
+        Logger.log(seq_name)
+        seq_names.append(seq_name)
+
+    cur_z_init_paths = []
+    cur_z_final_paths = []
+    cur_res_out_paths = []
+    for seq_name in seq_names:
+        # set current out paths based on sequence name
+        if res_out_path is not None:
+            cur_res_out_path = os.path.join(res_out_path, seq_name)
+            mkdir(cur_res_out_path)
+            cur_res_out_paths.append(cur_res_out_path)
+    cur_res_out_paths = cur_res_out_paths if len(cur_res_out_paths) > 0 else None
+    cur_z_init_paths = cur_z_init_paths if len(cur_z_init_paths) > 0 else None
+    cur_z_final_paths = cur_z_final_paths if len(cur_z_final_paths) > 0 else None
+    cam_mat = None
+
+    class Data(nn.Module):
+        "data class to make it easy to cast Tensors to cuda"
+        def __init__(self, **data_dict):
+            super(Data, self).__init__()
+            # make every key in the data dict a parameter
+            self._keys = []
+            for k, v in data_dict.items():
+                if isinstance(v, torch.Tensor):
+                    setattr(self, k, nn.Parameter(v))
+                elif isinstance(v, nn.Module):
+                    self.add_module(k, v)
+                else:
+                    setattr(self, k, v)
+                self._keys.append(k)
+        def __getitem__(self, item):
+            print(item)
+            return getattr(self, item)
+        def keys(self):
+            return self._keys
+        def as_dict(self):
+            return {k : getattr(self, k) for k in self._keys}
+        def __contains__(self, item):
+            return item in self._keys
+    return Data(
+        observed_data=Data(**observed_data),
+        gt_data=Data(**gt_data),
+        obs_img_paths=obs_img_paths,
+        obs_mask_paths=obs_mask_paths,
+        cur_batch_size=cur_batch_size,
+        T=T,
+        seq_names=seq_names,
+        cur_z_init_paths=cur_z_init_paths,
+        cur_z_final_paths=cur_z_final_paths,
+        cur_res_out_paths=cur_res_out_paths,
+        cam_mat=cam_mat
+        )
+
+def save_info(args, gt_data, cur_res_out_paths):
+    body_model_path = args.smpl
+    # save informatio about gt body paths
+    gt_body_paths = None
+    if 'gender' in gt_data:
+        gt_body_paths = []
+        for cur_gender in gt_data['gender']:
+            gt_body_path = None
+            if args.gt_body_type == 'smplh':
+                gt_body_path = os.path.join(SMPLH_PATH, '%s/model.npz' % (cur_gender))
+            gt_body_paths.append(gt_body_path)
+
+    #  save meta results information about the optimized bm and GT bm (gender)
+    if args.save_results:
+        for bidx, cur_res_out_path in enumerate(cur_res_out_paths):
+            cur_meta_path = os.path.join(cur_res_out_path, 'meta.txt')
+            with open(cur_meta_path, 'w') as f:
+                f.write('optim_bm %s\n' % (body_model_path))
+                if gt_body_paths is None:
+                    f.write('gt_bm %s\n' % (body_model_path))
+                else:
+                    f.write('gt_bm %s\n' % (gt_body_paths[bidx]))
+
+
 def main(args, config_file):
+    # set seed
+    torch.manual_seed(0)
+    import random; random.seed(0)
+    np.random.seed(0)
+
     res_out_path = None
     if args.out is not None:
         mkdir(args.out)
@@ -49,7 +192,7 @@ def main(args, config_file):
     Logger.log('args: ' + str(args))
     # and save config
     cp_files(args.out, [config_file])
-    
+
     device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
     B = args.batch_size
@@ -160,7 +303,7 @@ def main(args, config_file):
             with open(args.rgb_intrinsics, 'r') as f:
                 intrins_data = json.load(f)
             cam_mat = np.array(intrins_data)
-        
+
         # Create dataset by splitting the video up into overlapping clips
         vid_name = '.'.join(args.data_path.split('/')[-1].split('.')[:-1])
         dataset = RGBVideoDataset(op_out_path,
@@ -182,7 +325,7 @@ def main(args, config_file):
     else:
         raise NotImplementedError('Fitting for arbitrary RGB-D videos is not yet implemented')
 
-    data_loader = DataLoader(dataset, 
+    data_loader = DataLoader(dataset,
                             batch_size=B,
                             shuffle=args.shuffle,
                             num_workers=0,
@@ -215,7 +358,7 @@ def main(args, config_file):
     for sidx in range(NSTAGES):
         stage_loss_weights = {k : v[sidx] for k, v in loss_weights.items()}
         all_stage_loss_weights.append(stage_loss_weights)
-        
+
     use_joints2d = max_loss_weights['joints2d'] > 0.0
 
     # must always have pose prior to optimize in latent space
@@ -225,7 +368,7 @@ def main(args, config_file):
 
     motion_prior = None
     Logger.log('Loading motion prior from %s...' % (args.humor))
-    motion_prior = HumorModel(in_rot_rep=args.humor_in_rot_rep, 
+    motion_prior = HumorModel(in_rot_rep=args.humor_in_rot_rep,
                                 out_rot_rep=args.humor_out_rot_rep,
                                 latent_size=args.humor_latent_size,
                                 model_data_config=args.humor_model_data_config,
@@ -257,128 +400,61 @@ def main(args, config_file):
         start_t = time.time()
         # these dicts have different data depending on modality
         # MUST have at least name
-        observed_data, gt_data = data
-        # both of these are a list of tuples, each list index is a frame and the tuple index is the seq within the batch
-        obs_img_paths = None if 'img_paths' not in observed_data else observed_data['img_paths'] 
-        obs_mask_paths = None if 'mask_paths' not in observed_data else observed_data['mask_paths']
-        observed_data = {k : v.to(device) for k, v in observed_data.items() if isinstance(v, torch.Tensor)}
-        for k, v in gt_data.items():
-            if isinstance(v, torch.Tensor):
-                gt_data[k] = v.to(device)
-        cur_batch_size = observed_data[list(observed_data.keys())[0]].size(0)
-        T = observed_data[list(observed_data.keys())[0]].size(1)
+        _data = prepare_data(data, use_overlap_loss, res_out_path).to(device)
 
-        if use_overlap_loss and 'seq_interval' not in observed_data:
-            print('Must have frame index labels from data to determine overlap')
-            exit()
+        state_pkl = 'run_fitting_debug_state.pkl'
+        dump_state = False
+        if dump_state:
+            if Path(state_pkl).exists():
+                raise Exception('State file already exists!')
+            with open(state_pkl, 'wb') as f:
+                state = {}
+                def is_pickleable(x):
+                    try:
+                        pickle.dumps(x)
+                        return True
+                    except:
+                        return False
+                for k, v in locals().items():
+                    if is_pickleable(v):
+                        state[k] = v
+                pickle.dump(state, f)
+        else:
+            with open(state_pkl, 'rb') as f:
+                state = pickle.load(f)
 
-        if cur_batch_size == 3:
-            # NOTE: hacky way to avoid bug with pytorch 3x3 matmul problems with batch size 3....
-            for k, v in observed_data.items():
-                if isinstance(v, torch.Tensor):
-                    observed_data[k] = torch.cat([v, v[-1:]], dim=0)
-                else:
-                    # otherwise it's a list
-                    observed_data[k] = v + [v[-1]]
-            for k, v in gt_data.items():
-                if isinstance(v, torch.Tensor):
-                    gt_data[k] = torch.cat([v, v[-1:]], dim=0)
-                else:
-                    # otherwise it's a list
-                    gt_data[k] = v + [v[-1]]
-                    if k == 'name':
-                        # change name so we don't overwrite
-                        gt_data[k][-1] = gt_data[k][-1] + '_copy'
-
-            # obs_img_paths and obs_mask_paths
-            if obs_img_paths is not None:
-                new_obs_img_paths = []
-                for img_paths in obs_img_paths:
-                    new_obs_img_paths.append(img_paths + [img_paths[-1]])
-                obs_img_paths = new_obs_img_paths
-            if obs_mask_paths is not None:
-                new_obs_mask_paths = []
-                for mask_paths in obs_mask_paths:
-                    new_obs_mask_paths.append(mask_paths + [mask_paths[-1]])
-                obs_mask_paths = new_obs_mask_paths
-
-            cur_batch_size = 4
-
-        # pass in the last batch index from previous batch is using overlap consistency
-        if use_overlap_loss and prev_batch_overlap_res_dict is not None:
-            observed_data['prev_batch_overlap_res'] = prev_batch_overlap_res_dict
-
-        seq_names = []
-        for gt_idx, gt_name in enumerate(gt_data['name']):
-            seq_name = gt_name + '_' + str(int(time.time())) + str(gt_idx)
-            Logger.log(seq_name)
-            seq_names.append(seq_name)
-
-        cur_z_init_paths = []
-        cur_z_final_paths = []
-        cur_res_out_paths = []
-        for seq_name in seq_names:
-            # set current out paths based on sequence name
-            if res_out_path is not None:
-                cur_res_out_path = os.path.join(res_out_path, seq_name)
-                mkdir(cur_res_out_path)
-                cur_res_out_paths.append(cur_res_out_path)
-        cur_res_out_paths = cur_res_out_paths if len(cur_res_out_paths) > 0 else None
-        cur_z_init_paths = cur_z_init_paths if len(cur_z_init_paths) > 0 else None
-        cur_z_final_paths = cur_z_final_paths if len(cur_z_final_paths) > 0 else None
+        assert _data.cur_batch_size == state['cur_batch_size']
+        assert _data.T == state['T']
 
         # get body model
         # load in from given path
         Logger.log('Loading SMPL model from %s...' % (args.smpl))
         body_model_path = args.smpl
         fit_gender = body_model_path.split('/')[-2]
-        num_betas = 16 if 'betas' not in gt_data else gt_data['betas'].size(2)
+        num_betas = 16 if 'betas' not in _data.gt_data else _data.gt_data['betas'].size(2)
         body_model = BodyModel(bm_path=body_model_path,
                                 num_betas=num_betas,
-                                batch_size=cur_batch_size*T,
+                                batch_size=_data.cur_batch_size*_data.T,
                                 use_vtx_selector=use_joints2d).to(device)
 
-        if body_model.model_type != 'smplh':
-            print('Only SMPL+H model is supported for HuMoR!')
-            exit()
+        assert body_model.model_type == 'smplh', 'Only SMPL+H model is supported for HuMoR!'
 
-        gt_body_paths = None
-        if 'gender' in gt_data:
-            gt_body_paths = []
-            for cur_gender in gt_data['gender']:
-                gt_body_path = None
-                if args.gt_body_type == 'smplh':
-                    gt_body_path = os.path.join(SMPLH_PATH, '%s/model.npz' % (cur_gender))
-                gt_body_paths.append(gt_body_path)
 
-        cam_mat = None
-        if 'cam_matx' in gt_data:
-            cam_mat = gt_data['cam_matx'].to(device)
-
-        #  save meta results information about the optimized bm and GT bm (gender)
-        if args.save_results:
-            for bidx, cur_res_out_path in enumerate(cur_res_out_paths):
-                cur_meta_path = os.path.join(cur_res_out_path, 'meta.txt')
-                with open(cur_meta_path, 'w') as f:
-                    f.write('optim_bm %s\n' % (body_model_path))
-                    if gt_body_paths is None:
-                        f.write('gt_bm %s\n' % (body_model_path))
-                    else:
-                        f.write('gt_bm %s\n' % (gt_body_paths[bidx]))
+        save_info(args, _data.gt_data, _data.cur_res_out_paths)
 
         # create optimizer
         optimizer = MotionOptimizer(device,
                                     body_model,
                                     num_betas,
-                                    cur_batch_size,
-                                    T,
-                                    [k for k in observed_data.keys()],
+                                    _data.cur_batch_size,
+                                    _data.T,
+                                    [k for k in _data.observed_data.keys()],
                                     all_stage_loss_weights,
                                     pose_prior,
                                     motion_prior,
                                     init_motion_prior,
                                     use_joints2d,
-                                    cam_mat,
+                                    _data.cam_mat,
                                     args.robust_loss,
                                     args.robust_tuning_const,
                                     args.joint2d_sigma,
@@ -387,21 +463,21 @@ def main(args, config_file):
                                     stage3_tune_init_freeze_start=args.stage3_tune_init_freeze_start,
                                     stage3_tune_init_freeze_end=args.stage3_tune_init_freeze_end,
                                     stage3_contact_refine_only=args.stage3_contact_refine_only,
-                                    use_chamfer=('points3d' in observed_data),
+                                    use_chamfer=('points3d' in _data.observed_data),
                                     im_dim=im_dim)
 
         # run optimizer
-        optim_result, per_stage_results = optimizer.run(observed_data,
+        optim_result, per_stage_results = optimizer.run(_data.observed_data,
                                                         data_fps=data_fps,
                                                         lr=args.lr,
                                                         num_iter=args.num_iters,
                                                         lbfgs_max_iter=args.lbfgs_max_iter,
-                                                        stages_res_out=cur_res_out_paths,
+                                                        stages_res_out=_data.cur_res_out_paths,
                                                         fit_gender=fit_gender)
 
         # save final results
         if cur_res_out_paths is not None:
-            save_optim_result(cur_res_out_paths, optim_result, per_stage_results, gt_data, observed_data, args.data_type,
+            save_optim_result(cur_res_out_paths, optim_result, per_stage_results, _data.gt_data, _data.observed_data, args.data_type,
                                 optim_floor=optimizer.optim_floor,
                                 obs_img_paths=obs_img_paths,
                                 obs_mask_paths=obs_mask_paths)
@@ -416,13 +492,13 @@ def main(args, config_file):
             prev_batch_overlap_res_dict['verts3d'] = per_stage_results['stage3']['verts3d'][-1].clone().detach()
             prev_batch_overlap_res_dict['betas'] = optim_result['betas'][-1].clone().detach()
             prev_batch_overlap_res_dict['floor_plane'] = optim_result['floor_plane'][-1].clone().detach()
-            prev_batch_overlap_res_dict['seq_interval'] = observed_data['seq_interval'][-1].clone().detach()
+            prev_batch_overlap_res_dict['seq_interval'] = _data.observed_data['seq_interval'][-1].clone().detach()
 
         if i < (len(data_loader) - 1):
             del optimizer
         del body_model
-        del observed_data
-        del gt_data
+        del _data.observed_data
+        del _data.gt_data
         torch.cuda.empty_cache()
 
     # if RGB video, stitch together subsequences
