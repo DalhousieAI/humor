@@ -141,9 +141,6 @@ class MotionOptimizer:
             use_chamfer=use_chamfer,
         ).to(device)
 
-    def initialize(self, observed_data):
-        assert not self.optim_floor
-
     def run(
         self,
         observed_data,
@@ -159,9 +156,9 @@ class MotionOptimizer:
 
         assert len(num_iter) == 3
 
-        per_stage_outputs = {}  # SMPL results after each stage
+        num_iter = [1, 1, 1]
 
-        self.initialize(observed_data) # does nothing if not using floor
+        per_stage_outputs = {}  # SMPL results after each stage
 
         #
         # Stage I: Only global root and orientation
@@ -627,97 +624,6 @@ class MotionOptimizer:
         assert not self.optim_floor
 
         return final_optim_res, per_stage_outputs
-
-    def apply_cam2prior(
-        self,
-        data_dict,
-        R,
-        t,
-        root_height,
-        body_pose,
-        betas,
-        key_frame_idx,
-        inverse=False,
-    ):
-        """
-        Applies the camera2prior tranformation made up of R, t to the data in data dict and
-        returns a new dictionary with the transformed data.
-        Right now supports: trans, root_orient.
-
-        NOTE: If the number of timesteps in trans/root_orient is 1, this function assumes they are at key_frame_idx.
-                (othherwise the calculation of cur_root_height or trans_offset in inverse case is not correct)
-
-        key_frame_idx : the timestep used to compute cam2prior size (B) tensor
-        inverse : if true, applies the inverse transformation from prior space to camera
-        """
-        prior_dict = dict()
-        if "root_orient" in data_dict:
-            # B x T x 3
-            root_orient = data_dict["root_orient"]
-            B, T, _ = root_orient.size()
-            R_time = R.unsqueeze(1).expand((B, T, 3, 3))
-            t_time = t.unsqueeze(1).expand((B, T, 3))
-            root_orient_mat = batch_rodrigues(root_orient.reshape((-1, 3))).reshape(
-                (B, T, 3, 3)
-            )
-            if inverse:
-                prior_root_orient_mat = torch.matmul(
-                    R_time.transpose(3, 2), root_orient_mat
-                )
-            else:
-                prior_root_orient_mat = torch.matmul(R_time, root_orient_mat)
-            prior_root_orient = rotation_matrix_to_angle_axis(
-                prior_root_orient_mat.reshape((B * T, 3, 3))
-            ).reshape((B, T, 3))
-            prior_dict["root_orient"] = prior_root_orient
-
-        if "trans" in data_dict and "root_orient" in data_dict:
-            # B x T x 3
-            trans = data_dict["trans"]
-            B, T, _ = trans.size()
-            R_time = R.unsqueeze(1).expand((B, T, 3, 3))
-            t_time = t.unsqueeze(1).expand((B, T, 3))
-            if inverse:
-                # transform so key frame at origin
-                if T > 1:
-                    trans_offset = trans[np.arange(B), key_frame_idx, :].unsqueeze(1)
-                else:
-                    trans_offset = trans[:, 0:1, :]
-                trans = trans - trans_offset
-                # rotates to camera frame
-                trans = torch.matmul(
-                    R_time.transpose(3, 2), trans.reshape((B, T, 3, 1))
-                )[:, :, :, 0]
-                # translate to camera frame
-                trans = trans - t_time
-            else:
-                # first transform so the trans of key frame is at origin
-                trans = trans + t_time
-                # then rotate to canonical frame
-                trans = torch.matmul(R_time, trans.reshape((B, T, 3, 1)))[:, :, :, 0]
-                # then apply floor offset so the root joint is at the desired height
-                cur_smpl_data, _ = self.smpl_results(
-                    trans, prior_dict["root_orient"], body_pose, betas
-                )
-                if T > 1:
-                    cur_root_height = cur_smpl_data["joints3d"][
-                        np.arange(B), key_frame_idx, 0, 2:3
-                    ]
-                else:
-                    cur_root_height = cur_smpl_data["joints3d"][:, 0, 0, 2:3]
-                height_diff = root_height - cur_root_height
-                trans_offset = torch.cat(
-                    [torch.zeros((B, 2)).to(height_diff), height_diff], axis=1
-                )
-                trans = trans + trans_offset.reshape((B, 1, 3))
-            prior_dict["trans"] = trans
-        elif "trans" in data_dict:
-            Logger.log(
-                "Cannot apply cam2prior on translation without root orient data!"
-            )
-            exit()
-
-        return prior_dict
 
     def estimate_velocities(
         self, trans, root_orient, body_pose, betas, data_fps, smpl_results=None

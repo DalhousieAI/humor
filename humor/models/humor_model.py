@@ -38,95 +38,6 @@ WORLD2ALIGN_NAME_CACHE = {
 }
 
 
-def step(
-    model, loss_func, data, dataset, device, cur_epoch, mode="train", use_gt_p=1.0
-):
-    """
-    Given data for the current training step (batch),
-    pulls out the necessary needed data,
-    runs the model,
-    calculates and returns the loss.
-
-    - use_gt_p : the probability of using ground truth as input to each step rather than the model's own prediction
-                 (1.0 is fully supervised, 0.0 is fully autoregressive)
-    """
-    use_sched_samp = use_gt_p < 1.0
-    batch_in, batch_out, meta = data
-
-    prep_data = model.prepare_input(
-        batch_in,
-        device,
-        data_out=batch_out,
-        return_input_dict=True,
-        return_global_dict=use_sched_samp,
-    )
-    if use_sched_samp:
-        x_past, x_t, gt_dict, input_dict, global_gt_dict = prep_data
-    else:
-        x_past, x_t, gt_dict, input_dict = prep_data
-
-    B, T, S_in, _ = x_past.size()
-    S_out = x_t.size(2)
-
-    if not use_sched_samp:
-        # fully supervised phase
-        # start by using gt at every step, so just form all steps from all sequences into one large batch
-        #       and get per-step predictions
-        x_past_batched = x_past.reshape((B * T, S_in, -1))
-        x_t_batched = x_t.reshape((B * T, S_out, -1))
-        out_dict = model(x_past_batched, x_t_batched)
-    else:
-        # in scheduled sampling or fully autoregressive phase
-        init_input_dict = dict()
-        for k in input_dict.keys():
-            init_input_dict[k] = input_dict[k][
-                :, 0, :, :
-            ]  # only need first step for init
-        # this out_dict is the global state
-        sched_samp_out = model.scheduled_sampling(
-            x_past,
-            x_t,
-            init_input_dict,
-            p=use_gt_p,
-            gender=meta["gender"],
-            betas=meta["betas"].to(device),
-            need_global_out=(not model.detach_sched_samp),
-        )
-        if model.detach_sched_samp:
-            out_dict = sched_samp_out
-        else:
-            out_dict, _ = sched_samp_out
-        # gt must be global state for supervision in this case
-        if not model.detach_sched_samp:
-            print("USING global supervision")
-            gt_dict = global_gt_dict
-
-    # loss can be computed per output step in parallel
-    # batch dicts accordingly
-    for k in out_dict.keys():
-        if k == "posterior_distrib" or k == "prior_distrib":
-            m, v = out_dict[k]
-            m = m.reshape((B * T, -1))
-            v = v.reshape((B * T, -1))
-            out_dict[k] = (m, v)
-        else:
-            out_dict[k] = out_dict[k].reshape((B * T * S_out, -1))
-    for k in gt_dict.keys():
-        gt_dict[k] = gt_dict[k].reshape((B * T * S_out, -1))
-
-    gender_in = np.broadcast_to(
-        np.array(meta["gender"]).reshape((B, 1, 1, 1)), (B, T, S_out, 1)
-    )
-    gender_in = gender_in.reshape((B * T * S_out, 1))
-    betas_in = meta["betas"].reshape((B, T, 1, -1)).expand((B, T, S_out, 16)).to(device)
-    betas_in = betas_in.reshape((B * T * S_out, 16))
-    loss, stats_dict = loss_func(
-        out_dict, gt_dict, cur_epoch, gender=gender_in, betas=betas_in
-    )
-
-    return loss, stats_dict
-
-
 class HumorModel(nn.Module):
     def __init__(
         self,
@@ -311,6 +222,7 @@ class HumorModel(nn.Module):
         Also creates a dictionary of GT outputs for use in computing the loss. And optionally
         a dictionary of inputs.
         """
+        assert False
 
         #
         # input data
@@ -453,40 +365,6 @@ class HumorModel(nn.Module):
 
         return x_pred_dict
 
-    def single_step(self, past_in, t_in):
-        """
-        single step that computes both prior and posterior for training. Samples from posterior
-        """
-        B = past_in.size(0)
-        # use past and future to encode latent transition
-        qm, qv = self.posterior(past_in, t_in)
-
-        # prior
-        pm, pv = None, None
-        if self.use_conditional_prior:
-            # predict prior based on past
-            pm, pv = self.prior(past_in)
-        else:
-            # use standard normal
-            pm, pv = torch.zeros_like(qm), torch.ones_like(qv)
-
-        # sample from posterior using reparam trick
-        z = self.rsample(qm, qv)
-
-        # decode to get next step
-        decoder_out = self.decode(z, past_in)
-        decoder_out = decoder_out.reshape(
-            (B, self.steps_out, -1)
-        )  # B x steps_out x D_out
-
-        # split output predictions and transform out rotations to matrices
-        x_pred_dict = self.split_output(decoder_out)
-
-        x_pred_dict["posterior_distrib"] = (qm, qv)
-        x_pred_dict["prior_distrib"] = (pm, pv)
-
-        return x_pred_dict
-
     def prior(self, past_in):
         """
         Encodes the posterior distribution using the past and future states.
@@ -516,14 +394,6 @@ class HumorModel(nn.Module):
         var = torch.exp(logvar)
 
         return mean, var
-
-    def rsample(self, mu, var):
-        """
-        Return gaussian sample of (mu, var) using reparameterization trick.
-        """
-        eps = torch.randn_like(mu)
-        z = mu + eps * torch.sqrt(var)
-        return z
 
     def decode(self, z, past_in):
         """
@@ -585,313 +455,6 @@ class HumorModel(nn.Module):
         decoder_out = decoder_out.reshape((B, -1))
 
         return decoder_out
-
-    def scheduled_sampling(
-        self,
-        x_past,
-        x_t,
-        init_input_dict,
-        p=0.5,
-        gender=None,
-        betas=None,
-        need_global_out=True,
-    ):
-        """
-        Given all inputs and ground truth outputs for all steps, roll out model predictions
-        where at each step use the GT input with prob p, otherwise use own previous output.
-
-        Input:
-        - x_past (B x T x steps_in x D)
-        - x_t    (B x T x steps_out x D)
-        - init_input_dict : dictionary of each initial state (B x steps_in x D), rotations should be matrices
-        - p : probability of using the GT input at each step of the sequence
-        - gender/betas only required if self.use_smpl_joint_inputs is true (used to decide the SMPL body model)
-        """
-        B, T, S, D = x_past.size()
-        S_out = x_t.size(2)
-        J = len(SMPL_JOINTS)
-        cur_input_dict = init_input_dict  # this is the predicted input dict
-
-        # initial input must be from GT since we don't have any predictions yet
-        past_in = x_past[:, 0, :, :].reshape((B, -1))
-        t_in = x_t[:, 0, :, :].reshape((B, -1))
-
-        global_world2local_rot = (
-            torch.eye(3).reshape((1, 1, 3, 3)).expand((B, 1, 3, 3)).to(x_past)
-        )
-        global_world2local_trans = torch.zeros((B, 1, 3)).to(x_past)
-        trans2joint = torch.zeros((B, 1, 1, 3)).to(x_past)
-        if self.need_trans2joint:
-            trans2joint = -torch.cat(
-                [cur_input_dict["joints"][:, -1, :2], torch.zeros((B, 1)).to(x_past)],
-                axis=1,
-            ).reshape(
-                (B, 1, 1, 3)
-            )  # same for whole sequence
-        pred_local_seq = []
-        pred_global_seq = []
-        for t in range(T):
-            # sample next step from model
-            x_pred_dict = self.single_step(past_in, t_in)
-
-            # save output
-            pred_local_seq.append(x_pred_dict)
-
-            # output is the actual regressed joints, but input to next step can use smpl joints
-            x_pred_smpl_joints = None
-            if self.use_smpl_joint_inputs and gender is not None and betas is not None:
-                # this assumes the model is actually outputting everything we need to run SMPL
-                # also assumes single output step
-                smpl_trans = x_pred_dict["trans"][:, 0:1].reshape(
-                    (B, 3)
-                )  # only want immediate next frame
-                smpl_root_orient = rotation_matrix_to_angle_axis(
-                    x_pred_dict["root_orient"][:, 0:1].reshape((B, 3, 3))
-                ).reshape((B, 3))
-                smpl_betas = betas[:, 0, :]
-                smpl_pose_body = rotation_matrix_to_angle_axis(
-                    x_pred_dict["pose_body"][:, 0:1].reshape((B * (J - 1), 3, 3))
-                ).reshape((B, (J - 1) * 3))
-
-                smpl_vals = [smpl_trans, smpl_root_orient, smpl_betas, smpl_pose_body]
-                # batch may be a mix of genders, so need to carefully use the corresponding SMPL body model
-                gender_names = ["male", "female", "neutral"]
-                pred_joints = []
-                prev_nbidx = 0
-                cat_idx_map = np.ones((B), dtype=np.int) * -1
-                for gender_name in gender_names:
-                    gender_idx = np.array(gender) == gender_name
-                    nbidx = np.sum(gender_idx)
-
-                    cat_idx_map[gender_idx] = np.arange(
-                        prev_nbidx, prev_nbidx + nbidx, dtype=np.int
-                    )
-                    prev_nbidx += nbidx
-
-                    gender_smpl_vals = [val[gender_idx] for val in smpl_vals]
-
-                    # need to pad extra frames with zeros in case not as long as expected
-                    pad_size = self.smpl_batch_size - nbidx
-                    if pad_size == B:
-                        # skip if no frames for this gender
-                        continue
-                    pad_list = gender_smpl_vals
-                    if pad_size < 0:
-                        raise Exception(
-                            "SMPL model batch size not large enough to accomodate!"
-                        )
-                    elif pad_size > 0:
-                        pad_list = self.zero_pad_tensors(pad_list, pad_size)
-
-                    # reconstruct SMPL
-                    cur_pred_trans, cur_pred_orient, cur_betas, cur_pred_pose = pad_list
-                    bm = self.bm_dict[gender_name]
-                    pred_body = bm(
-                        pose_body=cur_pred_pose,
-                        betas=cur_betas,
-                        root_orient=cur_pred_orient,
-                        trans=cur_pred_trans,
-                    )
-                    if pad_size > 0:
-                        pred_joints.append(pred_body.Jtr[:-pad_size])
-                    else:
-                        pred_joints.append(pred_body.Jtr)
-
-                # cat all genders and reorder to original batch ordering
-                x_pred_smpl_joints = torch.cat(pred_joints, axis=0)[
-                    :, : len(SMPL_JOINTS), :
-                ].reshape((B, 1, -1))
-                x_pred_smpl_joints = x_pred_smpl_joints[cat_idx_map]
-
-            # prepare predicted input to next step in case needed
-            # update input dict with new frame
-            del_keys = []
-            for k in cur_input_dict.keys():
-                if k in x_pred_dict:
-                    # drop oldest frame and add new prediction
-                    keep_frames = cur_input_dict[k][:, 1:, :]
-                    # print(keep_frames.size())
-                    if (
-                        k == "joints"
-                        and self.use_smpl_joint_inputs
-                        and x_pred_smpl_joints is not None
-                    ):
-                        # print('Using SMPL joints rather than regressed joints...')
-                        if self.detach_sched_samp:
-                            cur_input_dict[k] = torch.cat(
-                                [keep_frames, x_pred_smpl_joints.detach()], axis=1
-                            )
-                        else:
-                            cur_input_dict[k] = torch.cat(
-                                [keep_frames, x_pred_smpl_joints], axis=1
-                            )
-                    else:
-                        if self.detach_sched_samp:
-                            cur_input_dict[k] = torch.cat(
-                                [keep_frames, x_pred_dict[k][:, 0:1, :].detach()],
-                                axis=1,
-                            )
-                        else:
-                            cur_input_dict[k] = torch.cat(
-                                [keep_frames, x_pred_dict[k][:, 0:1, :]], axis=1
-                            )
-                    # print(cur_input_dict[k].size())
-                else:
-                    del_keys.append(k)
-            for k in del_keys:
-                del cur_input_dict[k]  # don't need it anymore
-
-            # get world2aligned rot and translation
-            if self.detach_sched_samp:
-                root_orient_mat = (
-                    x_pred_dict["root_orient"][:, 0, :].reshape((B, 3, 3)).detach()
-                )
-                world2aligned_rot = compute_world2aligned_mat(root_orient_mat)
-                world2aligned_trans = torch.cat(
-                    [
-                        -x_pred_dict["trans"][:, 0, :2].detach(),
-                        torch.zeros((B, 1)).to(x_past),
-                    ],
-                    axis=1,
-                )
-            else:
-                root_orient_mat = x_pred_dict["root_orient"][:, 0, :].reshape((B, 3, 3))
-                world2aligned_rot = compute_world2aligned_mat(root_orient_mat)
-                world2aligned_trans = torch.cat(
-                    [-x_pred_dict["trans"][:, 0, :2], torch.zeros((B, 1)).to(x_past)],
-                    axis=1,
-                )
-
-            #
-            # transform inputs to this local frame for next step
-            #
-            cur_input_dict = self.apply_world2local_trans(
-                world2aligned_trans,
-                world2aligned_rot,
-                trans2joint,
-                cur_input_dict,
-                cur_input_dict,
-                invert=False,
-            )
-
-            # convert rots to correct input format
-            if self.in_rot_rep == "aa":
-                if "root_orient" in self.data_names:
-                    cur_input_dict["root_orient"] = rotation_matrix_to_angle_axis(
-                        cur_input_dict["root_orient"].reshape((B * S, 3, 3))
-                    ).reshape((B, S, 3))
-                if "pose_body" in self.data_names:
-                    cur_input_dict["pose_body"] = rotation_matrix_to_angle_axis(
-                        cur_input_dict["pose_body"].reshape((B * S * (J - 1), 3, 3))
-                    ).reshape((B, S, (J - 1) * 3))
-            elif self.in_rot_rep == "6d":
-                if "root_orient" in self.data_names:
-                    cur_input_dict["root_orient"] = cur_input_dict["root_orient"][
-                        :, :, :6
-                    ]
-                if "pose_body" in self.data_names:
-                    cur_input_dict["pose_body"] = (
-                        cur_input_dict["pose_body"]
-                        .reshape((B, S, J - 1, 9))[:, :, :, :6]
-                        .reshape((B, S, (J - 1) * 6))
-                    )
-
-            if need_global_out:
-                #
-                # compute current world output and update world2local transform
-                #
-                cur_world_dict = dict()
-                cur_world_dict = self.apply_world2local_trans(
-                    global_world2local_trans,
-                    global_world2local_rot,
-                    trans2joint,
-                    x_pred_dict,
-                    cur_world_dict,
-                    invert=True,
-                )
-
-                if self.detach_sched_samp:
-                    global_world2local_trans = torch.cat(
-                        [
-                            -cur_world_dict["trans"][:, 0:1, :2].detach(),
-                            torch.zeros((B, 1, 1)).to(x_past),
-                        ],
-                        axis=2,
-                    )
-                else:
-                    global_world2local_trans = torch.cat(
-                        [
-                            -cur_world_dict["trans"][:, 0:1, :2],
-                            torch.zeros((B, 1, 1)).to(x_past),
-                        ],
-                        axis=2,
-                    )
-
-                global_world2local_rot = torch.matmul(
-                    global_world2local_rot, world2aligned_rot.reshape((B, 1, 3, 3))
-                )
-
-                pred_global_seq.append(cur_world_dict)
-
-            if t + 1 < T:
-                # choose whether next step will use GT or predicted inputs and prepare them
-                if np.random.random_sample() < p:
-                    # use GT
-                    past_in = x_past[:, t + 1, :, :].reshape((B, -1))
-                else:
-                    # cat all inputs together to form past_in
-                    in_data_list = []
-                    for k in self.data_names:
-                        in_data_list.append(cur_input_dict[k])
-                    past_in = torch.cat(in_data_list, axis=2)
-                    past_in = past_in.reshape((B, -1))
-
-                # GT output is the same no matter what
-                t_in = x_t[:, t + 1, :, :].reshape((B, -1))
-
-        if need_global_out:
-            # aggregate pred_seq
-            pred_global_seq_out = dict()
-            for k in pred_global_seq[0].keys():
-                if k == "posterior_distrib" or k == "prior_distrib":
-                    m = torch.stack(
-                        [pred_global_seq[i][k][0] for i in range(len(pred_global_seq))],
-                        axis=1,
-                    )
-                    v = torch.stack(
-                        [pred_global_seq[i][k][1] for i in range(len(pred_global_seq))],
-                        axis=1,
-                    )
-                    pred_global_seq_out[k] = (m, v)
-                else:
-                    pred_global_seq_out[k] = torch.stack(
-                        [pred_global_seq[i][k] for i in range(len(pred_global_seq))],
-                        axis=1,
-                    )
-
-        # aggregate pred_seq
-        pred_local_seq_out = dict()
-        for k in pred_local_seq[0].keys():
-            # print(k)
-            if k == "posterior_distrib" or k == "prior_distrib":
-                m = torch.stack(
-                    [pred_local_seq[i][k][0] for i in range(len(pred_local_seq))],
-                    axis=1,
-                )
-                v = torch.stack(
-                    [pred_local_seq[i][k][1] for i in range(len(pred_local_seq))],
-                    axis=1,
-                )
-                pred_local_seq_out[k] = (m, v)
-            else:
-                pred_local_seq_out[k] = torch.stack(
-                    [pred_local_seq[i][k] for i in range(len(pred_local_seq))], axis=1
-                )
-
-        if need_global_out:
-            return pred_global_seq_out, pred_local_seq_out
-        else:
-            return pred_local_seq_out
 
     def apply_world2local_trans(
         self,
@@ -1013,16 +576,6 @@ class HumorModel(nn.Module):
                 exit()
 
         return output_dict
-
-    def zero_pad_tensors(self, pad_list, pad_size):
-        """
-        Assumes tensors in pad_list are B x D
-        """
-        new_pad_list = []
-        for pad_idx, pad_tensor in enumerate(pad_list):
-            padding = torch.zeros((pad_size, pad_tensor.size(1))).to(pad_tensor)
-            new_pad_list.append(torch.cat([pad_tensor, padding], dim=0))
-        return new_pad_list
 
     def roll_out(
         self,
@@ -1452,8 +1005,9 @@ class HumorModel(nn.Module):
             infer_state.append(prior_z[0], prior_z[1], posterior_z[0], posterior_z[1])
 
         infer_state.stack()
-
-        return (prior_m_seq, prior_v_seq), (post_m_seq, post_v_seq)
+        # unpacking dataclass because the rest of the code doesn't expect it
+        return (infer_state.prior_m_seq, infer_state.prior_v_seq),\
+               (infer_state.post_m_seq, infer_state.post_v_seq)
 
     def infer(self, x_past, x_t):
         """
