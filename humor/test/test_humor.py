@@ -370,11 +370,20 @@ def viz_eval_samp(
         cur_offscreen = out_path_list[b] is not None
         from viz.utils import viz_smpl_seq, create_video
         from fairmotion.data import bvh, amass
+
         body_dict = vars(body_pred)
         _bm = amass.load_body_model("body_models/smplh/female/model.npz")
-        for k,v in body_dict.items():
+        for k, v in body_dict.items():
             print(k, v.size())
-        motion = amass._create_motion_from_amass_data({'poses': body_pred.full_pose.numpy(), 'betas': body_pred.betas[0].numpy(), "mocap_framerate": 30}, _bm)
+        motion = amass._create_motion_from_amass_data(
+            {
+                "poses": body_pred.full_pose.numpy(),
+                "betas": body_pred.betas[0].numpy(),
+                "mocap_framerate": 30, # I know it is but's it's here somewhere
+                "trans": pred_world_trans[0].numpy(),
+            },
+            _bm,
+        )
         bvh.save(motion, "humor_test.bvh")
         assert False
         body_alpha = 0.5 if viz_joints is not None and cur_offscreen else 1.0
