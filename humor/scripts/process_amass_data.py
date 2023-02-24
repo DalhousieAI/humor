@@ -19,6 +19,10 @@ from viz.utils import viz_smpl_seq
 from utils.torch import copy2cpu as c2c
 from utils.transforms import batch_rodrigues, compute_world2aligned_mat, compute_world2aligned_joints_mat, axisangle2matrots
 
+import logging
+logging.basicConfig(filename='preprocessing_amass.log', level=logging.DEBUG)
+print = lambda x: logging.info(x)
+
 #
 # Processing options
 #
@@ -34,11 +38,11 @@ DISCARD_TERRAIN_SEQUENCES = True # throw away sequences where the person steps o
 VIZ_PLOTS = False
 VIZ_SEQ = False
 
-ALL_DATASETS = ['ACCAD', 'BMLmovi', 'BioMotionLab_NTroje', 'BMLhandball', 'CMU', 'DanceDB', 'DFaust_67', 
-                'EKUT', 'Eyes_Japan_Dataset', 'HumanEva', 'KIT', 'MPI_HDM05', 
-                'MPI_Limits', 'MPI_mosh', 'SFU', 'SSM_synced', 'TCD_handMocap', 
+ALL_DATASETS = ['ACCAD', 'BMLmovi', 'BioMotionLab_NTroje', 'BMLhandball', 'CMU', 'DanceDB', 'DFaust_67',
+                'EKUT', 'Eyes_Japan_Dataset', 'HumanEva', 'KIT', 'MPI_HDM05',
+                'MPI_Limits', 'MPI_mosh', 'SFU', 'SSM_synced', 'TCD_handMocap',
                 'TotalCapture', 'Transitions_mocap'] # everything in AMASS
-TRAIN_DATASETS = ['CMU', 'MPI_Limits', 'TotalCapture', 'Eyes_Japan_Dataset', 'KIT', 'BioMotionLab_NTroje', 'BMLmovi', 
+TRAIN_DATASETS = ['CMU', 'MPI_Limits', 'TotalCapture', 'Eyes_Japan_Dataset', 'KIT', 'BioMotionLab_NTroje', 'BMLmovi',
                     'EKUT', 'ACCAD'] # HuMoR training dataset
 TEST_DATASETS = ['Transitions_mocap', 'HumanEva'] # HuMoR test datasets
 VAL_DATASETS = ['MPI_HDM05', 'SFU', 'MPI_mosh'] # HuMoR validation datasets
@@ -190,7 +194,7 @@ def determine_floor_height_and_contacts(body_joint_seq, fps):
             plt.show()
             plt.close()
 
-        floor_height = min_median 
+        floor_height = min_median
         offset_floor_height = floor_height - FLOOR_HEIGHT_OFFSET # toe joint is actually inside foot mesh a bit
 
         if DISCARD_TERRAIN_SEQUENCES:
@@ -327,7 +331,7 @@ def estimate_angular_velocity(rot_seq, h):
     R = rot_seq[1:-1]
     RT = np.swapaxes(R, -1, -2)
     # compute skew-symmetric angular velocity tensor
-    w_mat = np.matmul(dRdt, RT) 
+    w_mat = np.matmul(dRdt, RT)
 
     # pull out angular velocity vector
     # average symmetric entries
@@ -420,7 +424,7 @@ def process_seq(data_paths):
         vtx_seq = np.concatenate(body_vtx_seq, axis=0)
         print(vtx_seq.shape)
 
-    # determine floor height and foot contacts 
+    # determine floor height and foot contacts
     floor_height, contacts, discard_seq = determine_floor_height_and_contacts(joint_seq, fps)
     print('Floor height: %f' % (floor_height))
     # translate so floor is at z=0
@@ -514,7 +518,7 @@ def process_seq(data_paths):
     # NOTE: debug viz
     if VIZ_SEQ:
         body = get_body_model_sequence(smplh_path, gender, num_frames,
-                            pose_body, pose_hand, betas, root_orient, trans)    
+                            pose_body, pose_hand, betas, root_orient, trans)
         # debug_viz_seq(body, fps, contacts=contacts)
         viz_smpl_seq(body, imw=1080, imh=1080, fps=fps, contacts=contacts,
             render_body=True, render_joints=True, render_skeleton=False, render_ground=True,
@@ -559,7 +563,7 @@ def process_seq(data_paths):
 def main(config):
     start_time = time.time()
     out_folder = config.out
-    if not os.path.exists(out_folder):
+    if not os.path.exists(out_folder) and not os.path.islink(out_folder):
         os.mkdir(out_folder)
 
     # get all available datasets
@@ -615,11 +619,12 @@ def main(config):
 
         all_seq_in_files += input_seqs
         all_seq_out_files += output_seqs
-    
+
     smplh_paths = [config.smplh_root]*len(all_seq_in_files)
     data_paths = list(zip(all_seq_in_files, all_seq_out_files, smplh_paths))
 
-    for data_in in data_paths:
+    from tqdm.auto import tqdm
+    for data_in in tqdm(data_paths):
         process_seq(data_in)
 
     total_time = time.time() - start_time
