@@ -6,6 +6,7 @@ import glob
 import os
 import argparse
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ print = lambda x: logging.info(x)
 # Processing options
 #
 
-OUT_FPS = 30
+OUT_FPS = 60
 SAVE_KEYPT_VERTS = True # save vertex locations of certain keypoints
 SAVE_HAND_POSE = False # save joint angles for the hand
 SAVE_VELOCITIES = True # save all parameter velocities available
@@ -625,6 +626,8 @@ def main(config):
 
     from tqdm.auto import tqdm
     for data_in in tqdm(data_paths):
+        if Path(data_in[1]).exists():
+            continue
         process_seq(data_in)
 
     total_time = time.time() - start_time
